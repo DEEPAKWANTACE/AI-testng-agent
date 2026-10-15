@@ -1,0 +1,9 @@
+# Never upload local secrets or local data
+.env
+.env.*
+!.env.example
+storage
+node_modules
+.next
+coverage
+src/generated
