@@ -2,7 +2,7 @@ import { db } from "@/lib/db";
 import { requestGeneration } from "@/modules/generation/service";
 
 const CHUNK = 12;
-const MAX_FEATURES = 60;
+const MAX_FEATURES = 200;
 
 /**
  * Called by the discovery worker when an auto-test crawl completes: queues generation for

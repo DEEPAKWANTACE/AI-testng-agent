@@ -14,6 +14,7 @@ const flag = z.enum(["true", "false"]).default("false").transform((value) => val
 const configSchema = z.object({
   DISCOVERY_PAGE_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(15_000),
   DISCOVERY_RUN_TIMEOUT_MS: z.coerce.number().int().min(5_000).max(3_600_000).default(300_000),
+  DISCOVERY_PER_PAGE_BUDGET_MS: z.coerce.number().int().min(0).max(60_000).default(8_000),
   DISCOVERY_STALE_AFTER_MS: z.coerce.number().int().min(10_000).default(120_000),
   DISCOVERY_POLL_INTERVAL_MS: z.coerce.number().int().min(250).default(3_000),
   DISCOVERY_ALLOW_EXTERNAL_ASSETS: flag,
@@ -23,6 +24,8 @@ export type WorkerConfig = {
   workerId: string;
   pageTimeoutMs: number;
   runTimeoutMs: number;
+  /** Extra time budget per page for large crawls: a run may last max(runTimeoutMs, maxPages × this), up to 1 hour. 0 disables. */
+  perPageBudgetMs: number;
   staleAfterMs: number;
   pollIntervalMs: number;
   allowExternalAssets: boolean;
@@ -36,6 +39,7 @@ export function workerConfigFromEnv(overrides: Partial<WorkerConfig> = {}): Work
     workerId: `discovery-${process.pid}-${randomBytes(3).toString("hex")}`,
     pageTimeoutMs: env.DISCOVERY_PAGE_TIMEOUT_MS,
     runTimeoutMs: env.DISCOVERY_RUN_TIMEOUT_MS,
+    perPageBudgetMs: env.DISCOVERY_PER_PAGE_BUDGET_MS,
     staleAfterMs: env.DISCOVERY_STALE_AFTER_MS,
     pollIntervalMs: env.DISCOVERY_POLL_INTERVAL_MS,
     allowExternalAssets: env.DISCOVERY_ALLOW_EXTERNAL_ASSETS,
@@ -118,6 +122,7 @@ function summarize(stats: CrawlStats, featureCount: number): string {
     `${stop}: ${stats.pagesVisited} page${stats.pagesVisited === 1 ? "" : "s"} visited${stats.pagesFailed ? ` (${stats.pagesFailed} failed)` : ""}`,
     `${featureCount} feature${featureCount === 1 ? "" : "s"} found`,
     stats.authenticated ? "signed in" : null,
+    stats.skippedLinks["depth-limit"] ? `${stats.skippedLinks["depth-limit"]} links not followed (depth limit) — coverage is incomplete` : null,
     blocked ? `${blocked} request${blocked === 1 ? "" : "s"} blocked by the egress policy` : null,
   ]
     .filter(Boolean)
@@ -141,7 +146,8 @@ export async function processRun(runId: string, config: WorkerConfig): Promise<v
       maxDepth: run.maxDepth,
       maxPages: run.maxPages,
       pageTimeoutMs: config.pageTimeoutMs,
-      runTimeoutMs: config.runTimeoutMs,
+      // Big crawls need more than the base budget: add time per page, capped at one hour.
+      runTimeoutMs: Math.min(3_600_000, Math.max(config.runTimeoutMs, run.maxPages * config.perPageBudgetMs)),
       allowExternalAssets: config.allowExternalAssets,
       credentials,
       shouldContinue: async () => {

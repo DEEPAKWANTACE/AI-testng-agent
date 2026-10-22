@@ -20,7 +20,7 @@ let engineer: Actor, outsider: Actor;
 let projectId: string;
 
 const config = (overrides: Partial<WorkerConfig> = {}) =>
-  workerConfigFromEnv({ pageTimeoutMs: 2_500, runTimeoutMs: 60_000, allowExternalAssets: false, ...overrides });
+  workerConfigFromEnv({ pageTimeoutMs: 2_500, runTimeoutMs: 60_000, perPageBudgetMs: 0, allowExternalAssets: false, ...overrides });
 
 const path_ = (url: string) => new URL(url).pathname + new URL(url).search;
 
@@ -313,7 +313,7 @@ describe("web app integration", () => {
 
     const outside = await submit(createDiscoveryRun, { applicationId: app.id, startUrl: `http://127.0.0.1:${canary.port}/`, maxDepth: "2", maxPages: "10" });
     expect(outside.message).toContain("Start URL must be within the application's authorized URL");
-    expect((await submit(createDiscoveryRun, { applicationId: app.id, startUrl: demo.url, maxDepth: "9", maxPages: "500" })).fieldErrors).toMatchObject({
+    expect((await submit(createDiscoveryRun, { applicationId: app.id, startUrl: demo.url, maxDepth: "11", maxPages: "1001" })).fieldErrors).toMatchObject({
       maxDepth: expect.any(Array),
       maxPages: expect.any(Array),
     });

@@ -86,7 +86,15 @@ async function AutoTestCard() {
               </div>
               <TextField name="loginUrl" label="Login page URL (optional)" type="url" placeholder="Defaults to the application URL" />
             </fieldset>
-            <TextField name="maxPages" label="Max pages to crawl" type="number" min={1} max={200} defaultValue="60" />
+            <TextField
+              name="maxPages"
+              label="Max pages to crawl"
+              type="number"
+              min={1}
+              max={1000}
+              defaultValue="500"
+              hint="Crawls up to 10 clicks deep. The run summary says whether it finished or stopped at this limit — raise it if it stopped early."
+            />
             <label className="flex items-start gap-2 text-sm text-zinc-700 dark:text-zinc-300">
               <input type="checkbox" name="authorized" className="mt-1" />
               <span>I&rsquo;m authorized to test this application with this account, and it doesn&rsquo;t hold real customer data I can&rsquo;t afford to change.</span>

@@ -137,8 +137,8 @@ async function NewRunCard({ searchParams }: { searchParams: PageProps<"/discover
               hint="Must be within the application's authorized URL."
             />
             <div className="grid gap-4 sm:grid-cols-2">
-              <TextField name="maxDepth" label="Max depth" type="number" min={1} max={5} defaultValue="2" hint="Clicks from the start page." />
-              <TextField name="maxPages" label="Max pages" type="number" min={1} max={200} defaultValue="25" />
+              <TextField name="maxDepth" label="Max depth" type="number" min={1} max={10} defaultValue="5" hint="Clicks from the start page. 10 is the maximum." />
+              <TextField name="maxPages" label="Max pages" type="number" min={1} max={1000} defaultValue="200" hint="Up to 1000. The time limit grows with this value." />
             </div>
           </ActionForm>
         )}

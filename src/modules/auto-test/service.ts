@@ -12,7 +12,7 @@ import type { AutoTestInput } from "./schemas";
 
 const USERNAME_SECRET = "AUTO_TEST_USERNAME";
 const PASSWORD_SECRET = "AUTO_TEST_PASSWORD";
-const MAX_DEPTH = 3;
+const MAX_DEPTH = 10;
 
 /** Stores (or replaces) an encrypted LOCAL secret and returns its id. The value is never logged. */
 async function upsertLocalSecret(actor: Actor, applicationId: string, name: string, value: string): Promise<string> {
