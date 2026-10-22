@@ -46,3 +46,6 @@ next-env.d.ts
 
 # discovery evidence (local artifact storage)
 /storage
+
+# Claude Code local settings
+/.claude/settings.local.json
