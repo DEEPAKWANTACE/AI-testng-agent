@@ -6,11 +6,12 @@ import { DEMO_CREDENTIALS, startCanary, startDemoApp, type DemoApp } from "../..
 import { db } from "@/lib/db";
 import type { Actor } from "@/modules/auth/service";
 import { autoTestInputSchema } from "@/modules/auto-test/schemas";
+import { addSecretReference } from "@/modules/applications/actions";
 import { startAutoTest } from "@/modules/auto-test/service";
 import { processGeneration } from "@/modules/generation/service";
 import { resolveSecret } from "@/modules/secrets/resolver";
 import { processNextRun, workerConfigFromEnv } from "@/worker/discovery/worker";
-import { createProject, createUser, resetDatabase } from "../helpers/fixtures";
+import { createProject, createUser, resetDatabase, signInAs, submit } from "../helpers/fixtures";
 
 let demo: DemoApp;
 let canary: Awaited<ReturnType<typeof startCanary>>;
@@ -149,5 +150,40 @@ describe("end to end: crawl → automatic generation → human review", () => {
     await processNextRun(workerConfig());
     expect((await db().discoveryRun.findUniqueOrThrow({ where: { id: runId } })).status).not.toBe("COMPLETED");
     expect(await db().generationJob.count({ where: { applicationId } })).toBe(0);
+  });
+});
+
+describe("Secret references form with a typed value", () => {
+  it("stores the value encrypted under a normalised name, and replaces it on re-save", async () => {
+    const app = await db().application.findFirstOrThrow({ where: { projectId } });
+    await signInAs(editor);
+
+    const saved = await submit(addSecretReference.bind(null, app.id), { name: "User name- crm admin", value: "Superadmin@ayucrm123", reference: "" });
+    expect(saved.status).toBe("success");
+    const row = await db().applicationSecret.findFirstOrThrow({ where: { applicationId: app.id, name: "USER_NAME_CRM_ADMIN" } });
+    expect(row.provider).toBe("LOCAL");
+    expect(JSON.stringify(row)).not.toContain("Superadmin");
+    expect(await resolveSecret(row.reference)).toBe("Superadmin@ayucrm123");
+
+    await submit(addSecretReference.bind(null, app.id), { name: "user name- crm admin", value: "changed", reference: "" });
+    expect(await db().applicationSecret.count({ where: { applicationId: app.id } })).toBe(1);
+    expect(await resolveSecret(row.reference)).toBe("changed");
+  });
+
+  it("still validates references when no value is typed, and never echoes a value", async () => {
+    const app = await db().application.findFirstOrThrow({ where: { projectId } });
+    await signInAs(editor);
+    const bad = await submit(addSecretReference.bind(null, app.id), { name: "CRM_USER", value: "", reference: "" });
+    expect(bad.status).toBe("error");
+    expect(bad.fieldErrors?.reference?.[0]).toMatch(/Type a value/);
+    const emptyName = await submit(addSecretReference.bind(null, app.id), { name: "", value: "secret-pass", reference: "" });
+    expect(emptyName.status).toBe("error");
+    expect(emptyName.values?.value).toBe("");
+  });
+
+  it("viewers can't store credentials", async () => {
+    const app = await db().application.findFirstOrThrow({ where: { projectId } });
+    await signInAs(viewer);
+    expect((await submit(addSecretReference.bind(null, app.id), { name: "X", value: "y", reference: "" })).status).toBe("error");
   });
 });

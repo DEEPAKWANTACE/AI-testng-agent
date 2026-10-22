@@ -5,7 +5,7 @@ import { failure, success, toActionError, validationError, type ActionState } fr
 import { revalidateDashboard } from "@/lib/revalidate";
 import { formDataToObject, idSchema } from "@/lib/validation";
 import { requireActor } from "@/modules/auth/session";
-import { secretReferenceInputSchema } from "@/modules/secrets/schemas";
+import { secretReferenceInputSchema, secretValueInputSchema } from "@/modules/secrets/schemas";
 import { applicationInputSchema } from "./schemas";
 import * as service from "./service";
 
@@ -66,8 +66,29 @@ export async function addSecretReference(applicationId: string, _prev: ActionSta
   const values = formDataToObject(formData);
   const id = idSchema.safeParse(applicationId);
   if (!id.success) return failure("Invalid application");
+  // Never echo a typed value back into the form.
+  const echo = { ...values, value: "" };
+
+  // A typed value is stored encrypted; otherwise the form is an external secret reference.
+  if (values.value) {
+    const typed = secretValueInputSchema.safeParse(values);
+    if (!typed.success) return validationError(typed.error, echo);
+    try {
+      await service.addSecretValue(actor, id.data, typed.data);
+    } catch (error) {
+      return toActionError(error, echo);
+    }
+    revalidateDashboard();
+    return success("Saved (encrypted).");
+  }
+
   const parsed = secretReferenceInputSchema.safeParse(values);
-  if (!parsed.success) return validationError(parsed.error, values);
+  if (!parsed.success) {
+    const state = validationError(parsed.error, echo);
+    return parsed.error.issues.some((i) => i.path[0] === "reference") && !values.reference
+      ? { ...state, fieldErrors: { ...state.fieldErrors, reference: ["Type a value above, or enter a reference such as env://QA_NAME"] } }
+      : state;
+  }
 
   try {
     await service.addSecretReference(actor, id.data, parsed.data);

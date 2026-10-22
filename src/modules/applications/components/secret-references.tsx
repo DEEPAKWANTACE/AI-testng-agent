@@ -34,7 +34,7 @@ export function SecretReferences({
     <Card>
       <CardHeader
         title="Secret references"
-        description="Credentials the agent may use, stored as pointers to a secret manager — never as values."
+        description="Credentials the agent may use: values you type are stored encrypted; or point to an external secret manager."
       />
       {secrets.length === 0 ? (
         <EmptyState title="No secret references" />
@@ -57,7 +57,7 @@ export function SecretReferences({
                 <ActionButton
                   action={removeSecretReference.bind(null, secret.id)}
                   variant="ghost"
-                  confirmMessage={`Remove the ${secret.name} reference? The secret itself is not affected.`}
+                  confirmMessage={secret.provider === "LOCAL" ? `Delete ${secret.name}? The stored encrypted value is removed.` : `Remove the ${secret.name} reference? The secret itself is not affected.`}
                 >
                   Remove
                 </ActionButton>
@@ -68,15 +68,22 @@ export function SecretReferences({
       )}
       {canManage ? (
         <CardBody className="border-t border-zinc-200 dark:border-zinc-800">
-          <ActionForm action={addSecretReference.bind(null, applicationId)} submitLabel="Add reference" pendingLabel="Adding…">
-            <TextField name="name" label="Name" placeholder="TEST_USER_PASSWORD" autoComplete="off" />
+          <ActionForm action={addSecretReference.bind(null, applicationId)} submitLabel="Save" pendingLabel="Saving…">
+            <TextField name="name" label="Name" placeholder="CRM_ADMIN_PASSWORD" autoComplete="off" hint="Any label; it's formatted automatically (e.g. CRM_ADMIN_PASSWORD)." />
+            <TextField
+              name="value"
+              label="Value (username or password)"
+              type="password"
+              autoComplete="new-password"
+              hint="Stored encrypted and never shown again. Fill this in, or use a reference below."
+            />
             <TextField
               name="reference"
-              label="Reference"
+              label="Or a reference (optional)"
               placeholder="env://QA_STOREFRONT_PASSWORD"
               autoComplete="off"
               spellCheck={false}
-              hint="env://QA_…, vault://path#key, aws-sm://…, gcp-sm://projects/…, azure-kv://vault/name. Never paste the secret itself."
+              hint="env://QA_…, vault://path#key, aws-sm://…, gcp-sm://projects/…, azure-kv://vault/name — only when no value is typed."
             />
             <TextField name="description" label="Description (optional)" autoComplete="off" />
           </ActionForm>

@@ -1,5 +1,4 @@
 import "server-only";
-import { randomBytes } from "node:crypto";
 import { DomainError } from "@/lib/action-state";
 import { db } from "@/lib/db";
 import { assertApplicationPermission } from "@/modules/access/service";
@@ -7,27 +6,13 @@ import { createApplication } from "@/modules/applications/service";
 import { audit } from "@/modules/audit/audit";
 import type { Actor } from "@/modules/auth/service";
 import { saveDiscoveryAuth } from "@/modules/discovery/auth-config";
-import { encryptSecret, isVaultConfigured } from "@/modules/secrets/vault";
+import { upsertLocalSecret } from "@/modules/secrets/local";
+import { isVaultConfigured } from "@/modules/secrets/vault";
 import type { AutoTestInput } from "./schemas";
 
 const USERNAME_SECRET = "AUTO_TEST_USERNAME";
 const PASSWORD_SECRET = "AUTO_TEST_PASSWORD";
 const MAX_DEPTH = 10;
-
-/** Stores (or replaces) an encrypted LOCAL secret and returns its id. The value is never logged. */
-async function upsertLocalSecret(actor: Actor, applicationId: string, name: string, value: string): Promise<string> {
-  const existing = await db().applicationSecret.findUnique({ where: { applicationId_name: { applicationId, name } }, select: { id: true } });
-  const id = existing?.id ?? `c${randomBytes(12).toString("hex")}`;
-  const data = {
-    provider: "LOCAL" as const,
-    reference: `local://${id}`,
-    encryptedValue: encryptSecret(value, id),
-    description: "Entered in the Auto-test form (encrypted at rest).",
-  };
-  if (existing) await db().applicationSecret.update({ where: { id }, data });
-  else await db().applicationSecret.create({ data: { id, applicationId, name, createdById: actor.id, ...data } });
-  return id;
-}
 
 /**
  * One-shot entry point: register the application (or reuse it), store the test account
@@ -63,8 +48,8 @@ export async function startAutoTest(actor: Actor, input: AutoTestInput) {
 
   if (hasCredentials) {
     await assertApplicationPermission(actor, applicationId, "secret.manage");
-    const usernameSecretId = await upsertLocalSecret(actor, applicationId, USERNAME_SECRET, input.username!);
-    const passwordSecretId = await upsertLocalSecret(actor, applicationId, PASSWORD_SECRET, input.password!);
+    const usernameSecretId = await upsertLocalSecret(actor, applicationId, USERNAME_SECRET, input.username!, "Entered in the Auto-test form (encrypted at rest).");
+    const passwordSecretId = await upsertLocalSecret(actor, applicationId, PASSWORD_SECRET, input.password!, "Entered in the Auto-test form (encrypted at rest).");
     await saveDiscoveryAuth(actor, applicationId, {
       mode: "FORM_LOGIN",
       loginUrl: input.loginUrl ?? input.url,

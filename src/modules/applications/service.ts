@@ -11,7 +11,8 @@ import {
 import { can } from "@/modules/access/policy";
 import type { Actor } from "@/modules/auth/service";
 import { secretAvailability } from "@/modules/secrets/resolver";
-import type { SecretReferenceInput } from "@/modules/secrets/schemas";
+import { upsertLocalSecret } from "@/modules/secrets/local";
+import type { SecretReferenceInput, SecretValueInput } from "@/modules/secrets/schemas";
 import { BLOCK_REASON_LABELS, staticUrlBlockReason } from "@/modules/discovery/network-policy";
 import type { ApplicationInput } from "./schemas";
 
@@ -130,6 +131,13 @@ export async function addSecretReference(actor: Actor, applicationId: string, in
     data: { ...input, applicationId, createdById: actor.id },
     select: { id: true },
   });
+}
+
+/** Stores a typed credential encrypted (replacing any secret with the same name). */
+export async function addSecretValue(actor: Actor, applicationId: string, input: SecretValueInput) {
+  await assertApplicationPermission(actor, applicationId, "secret.manage");
+  // Replacing in place keeps the secret's id, so login settings that use it keep working.
+  return { id: await upsertLocalSecret(actor, applicationId, input.name, input.value, input.description ?? undefined) };
 }
 
 export async function removeSecretReference(actor: Actor, secretId: string) {

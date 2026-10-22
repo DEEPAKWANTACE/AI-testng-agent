@@ -47,3 +47,19 @@ describe("credential vault", () => {
     expect(result.success).toBe(false);
   });
 });
+
+import { normalizeSecretName, secretValueInputSchema } from "@/modules/secrets/schemas";
+
+describe("typed secret values", () => {
+  it("normalises free-form names", () => {
+    expect(normalizeSecretName("superayuadmincrm")).toBe("SUPERAYUADMINCRM");
+    expect(normalizeSecretName("User name- crm admin")).toBe("USER_NAME_CRM_ADMIN");
+    expect(normalizeSecretName("1st user")).toBe("S_1ST_USER");
+  });
+
+  it("accepts a value with any name and rejects empty ones", () => {
+    expect(secretValueInputSchema.parse({ name: "crm admin", value: "Superadmin@ayucrm123" })).toMatchObject({ name: "CRM_ADMIN", value: "Superadmin@ayucrm123" });
+    expect(secretValueInputSchema.safeParse({ name: "crm", value: "" }).success).toBe(false);
+    expect(secretValueInputSchema.safeParse({ name: "---", value: "x" }).success).toBe(false);
+  });
+});

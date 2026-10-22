@@ -66,3 +66,24 @@ export const secretReferenceInputSchema = z
   .transform((value) => ({ ...value, provider: providerForReference(value.reference)! }));
 
 export type SecretReferenceInput = z.infer<typeof secretReferenceInputSchema>;
+
+/** Turns "User name- crm admin" into USER_NAME_CRM_ADMIN so people don't have to know the format. */
+export function normalizeSecretName(raw: string): string {
+  const name = raw.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 64);
+  return /^[A-Z]/.test(name) ? name : `S_${name}`.slice(0, 64);
+}
+
+/** A value typed into the dashboard; stored encrypted, never shown again. */
+export const secretValueInputSchema = z.object({
+  name: z
+    .string({ error: "Name is required" })
+    .trim()
+    .min(1, "Name is required")
+    .max(100)
+    .transform(normalizeSecretName)
+    .refine((n) => n !== "S_", "Name is required"),
+  value: z.string().min(1, "Value is required").max(512, "Value is too long"),
+  description: optionalText("Description", 500),
+});
+
+export type SecretValueInput = z.infer<typeof secretValueInputSchema>;
