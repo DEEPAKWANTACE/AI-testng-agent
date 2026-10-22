@@ -1,6 +1,9 @@
 import type { Prisma } from "@/generated/prisma/client";
 import type { DefectSeverity, Priority, ResultComparison, ResultStatus } from "@/generated/prisma/enums";
 import { db } from "@/lib/db";
+import { computeCoverage, COVERAGE_DISCLAIMER, summarizeCoverage, type LatestResult } from "@/modules/coverage/mapping";
+import { flakeRate } from "@/modules/execution/reproduction";
+import { parsePlanSnapshot, type PlanSnapshot } from "@/modules/test-suites/snapshot";
 
 /** Severity suggested for a failure, from the case's priority. Shown as a suggestion. */
 export const SEVERITY_FOR_PRIORITY: Record<Priority, DefectSeverity> = {
@@ -23,7 +26,10 @@ export function compareStatus(previous: ResultStatus | null, current: ResultStat
   return "UNCHANGED";
 }
 
-const FINISHED_RUN = { in: ["PASSED", "FAILED", "BLOCKED", "ERROR"] as Array<"PASSED" | "FAILED" | "BLOCKED" | "ERROR"> };
+/** Number of most recent runs of a case considered for its flake rate. */
+const FLAKE_WINDOW = 10;
+
+const FINISHED_RUN = { in: ["PASSED", "FAILED", "BLOCKED", "INCONCLUSIVE", "ERROR"] as Array<"PASSED" | "FAILED" | "BLOCKED" | "INCONCLUSIVE" | "ERROR"> };
 
 /**
  * Compares each result with the most recent earlier result for the same case (by caseKey)
@@ -52,10 +58,25 @@ export async function compareWithHistory(runId: string) {
       select: { status: true, testRunId: true },
     });
     const comparison = compareStatus(previous?.status ?? null, result.status);
+    // Recent executed history of the same case (oldest first, ending with this run).
+    const history = await db().testResult.findMany({
+      where: {
+        caseKey: result.caseKey,
+        testRunId: { not: runId },
+        status: { in: ["PASSED", "FAILED", "INCONCLUSIVE", "ERROR"] },
+        testRun: { status: FINISHED_RUN, createdAt: { lt: run.createdAt }, planVersion: { suite: { applicationId } } },
+      },
+      orderBy: { testRun: { createdAt: "desc" } },
+      take: FLAKE_WINDOW - 1,
+      select: { status: true },
+    });
     if (comparison === "REGRESSED") regressions++;
     if (comparison === "FIXED") fixed++;
     if (previous) priorRuns.set(previous.testRunId, (priorRuns.get(previous.testRunId) ?? 0) + 1);
-    await db().testResult.update({ where: { id: result.id }, data: { comparison, previousStatus: previous?.status ?? null } });
+    await db().testResult.update({
+      where: { id: result.id },
+      data: { comparison, previousStatus: previous?.status ?? null, flakeRate: flakeRate([...history.map((h) => h.status).reverse(), result.status]) },
+    });
   }
 
   const comparedToRunId = [...priorRuns.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
@@ -63,7 +84,7 @@ export async function compareWithHistory(runId: string) {
   return { regressions, fixed };
 }
 
-export type FeatureCoverage = { feature: string; total: number; passed: number; failed: number; blocked: number; skipped: number; passRate: number | null };
+export type FeatureCoverage = { feature: string; total: number; passed: number; failed: number; blocked: number; inconclusive: number; skipped: number; passRate: number | null };
 
 /** Counts, per-feature coverage and regression totals; stored on the Report row. */
 export async function buildReport(runId: string) {
@@ -72,8 +93,8 @@ export async function buildReport(runId: string) {
     where: { id: runId },
     select: {
       status: true,
-      planVersion: { select: { version: true, suite: { select: { name: true, applicationId: true } } } },
-      results: { select: { status: true, featureName: true } },
+      planVersion: { select: { version: true, snapshot: true, snapshotFormat: true, suite: { select: { name: true, applicationId: true } } } },
+      results: { select: { status: true, featureName: true, failureClass: true, flaky: true, caseKey: true, testRunId: true, network: true } },
     },
   });
   const count = (s: ResultStatus) => run.results.filter((r) => r.status === s).length;
@@ -81,10 +102,11 @@ export async function buildReport(runId: string) {
   const byFeature = new Map<string, FeatureCoverage>();
   for (const r of run.results) {
     const key = r.featureName ?? "(no feature)";
-    const entry = byFeature.get(key) ?? { feature: key, total: 0, passed: 0, failed: 0, blocked: 0, skipped: 0, passRate: null };
+    const entry = byFeature.get(key) ?? { feature: key, total: 0, passed: 0, failed: 0, blocked: 0, inconclusive: 0, skipped: 0, passRate: null };
     entry.total++;
     if (r.status === "PASSED") entry.passed++;
-    else if (r.status === "FAILED" || r.status === "ERROR") entry.failed++;
+    else if (r.status === "FAILED") entry.failed++;
+    else if (r.status === "INCONCLUSIVE" || r.status === "ERROR") entry.inconclusive++;
     else if (r.status === "BLOCKED") entry.blocked++;
     else entry.skipped++;
     byFeature.set(key, entry);
@@ -101,18 +123,47 @@ export async function buildReport(runId: string) {
     failed: count("FAILED") ,
     errored: count("ERROR"),
     blocked: count("BLOCKED"),
+    inconclusive: count("INCONCLUSIVE"),
     skipped: count("SKIPPED"),
+    flaky: run.results.filter((r) => r.flaky).length,
   };
-  const coverage = { features: [...byFeature.values()].sort((a, b) => a.feature.localeCompare(b.feature)), uncovered } as unknown as Prisma.InputJsonValue;
-  const summary = `${totals.passed} passed, ${totals.failed + totals.errored} failed, ${totals.blocked} blocked, ${totals.skipped} skipped` + (regressions ? ` · ${regressions} regression${regressions === 1 ? "" : "s"}` : "") + (fixed ? ` · ${fixed} fixed` : "");
+  const failureClasses: Record<string, number> = {};
+  for (const r of run.results) if (r.failureClass) failureClasses[r.failureClass] = (failureClasses[r.failureClass] ?? 0) + 1;
+  const coverage = {
+    features: [...byFeature.values()].sort((a, b) => a.feature.localeCompare(b.feature)),
+    uncovered,
+    inventory: await runInventoryCoverage(run),
+  } as unknown as Prisma.InputJsonValue;
+  const summary = `${totals.passed} passed, ${totals.failed} failed, ${totals.blocked} blocked, ${totals.inconclusive + totals.errored} inconclusive, ${totals.skipped} skipped` + (regressions ? ` · ${regressions} regression${regressions === 1 ? "" : "s"}` : "") + (fixed ? ` · ${fixed} fixed` : "") + (totals.flaky ? ` · ${totals.flaky} flaky` : "");
   const title = `${run.planVersion.suite.name} v${run.planVersion.version} — ${run.status.toLowerCase()}`;
 
   await db().report.upsert({
     where: { testRunId: runId },
-    create: { testRunId: runId, title, summary, ...totals, regressions, fixed, coverage },
-    update: { title, summary, ...totals, regressions, fixed, coverage },
+    create: { testRunId: runId, title, summary, ...totals, regressions, fixed, coverage, failureClasses },
+    update: { title, summary, ...totals, regressions, fixed, coverage, failureClasses },
   });
   return { ...totals, regressions, fixed };
+}
+
+/** How much of the known inventory this run's plan targets, and what this run verified. */
+async function runInventoryCoverage(run: {
+  planVersion: { snapshot: unknown; snapshotFormat: number; suite: { name: string; applicationId: string }; version: number };
+  results: Array<{ caseKey: string | null; status: ResultStatus; testRunId: string; network: unknown }>;
+}) {
+  if (run.planVersion.snapshotFormat !== 2) return null;
+  const items = await db().inventoryItem.findMany({ where: { applicationId: run.planVersion.suite.applicationId, active: true }, select: { id: true, kind: true, key: true, title: true } });
+  if (!items.length) return null;
+  const { snapshot } = parsePlanSnapshot(2, run.planVersion.snapshot) as { snapshot: PlanSnapshot };
+  const planned = snapshot.cases.map((testCase) => ({ suiteName: run.planVersion.suite.name, version: run.planVersion.version, testCase }));
+  const latest = new Map<string, LatestResult>(
+    run.results.filter((r) => r.caseKey && r.status !== "SKIPPED").map((r) => [r.caseKey!, { status: r.status, runId: r.testRunId, network: (r.network as LatestResult["network"]) ?? [] }]),
+  );
+  const coverage = computeCoverage(items, planned, latest);
+  return {
+    ...summarizeCoverage(items, coverage),
+    notVerified: coverage.filter((c) => c.level !== "VERIFIED").slice(0, 50).map((c) => items.find((i) => i.id === c.itemId)!.key),
+    disclaimer: COVERAGE_DISCLAIMER,
+  };
 }
 
 /** Everything a report view or download needs, already scoped to one run. */
@@ -138,7 +189,7 @@ export async function loadReportData(runId: string) {
         include: {
           stepResults: { orderBy: { position: "asc" }, include: { artifacts: { select: { id: true, kind: true } } } },
           artifacts: { select: { id: true, kind: true, name: true } },
-          defects: { select: { id: true, severity: true, status: true } },
+          defects: { select: { id: true, severity: true, status: true, verification: true, verifiedAt: true, verificationNote: true, verifiedBy: { select: { name: true } } } },
         },
       },
     },
@@ -148,9 +199,9 @@ export async function loadReportData(runId: string) {
     ...run,
     results: run.results.map((r) => ({
       ...r,
-      suggestedSeverity: r.status === "FAILED" || r.status === "ERROR" ? SEVERITY_FOR_PRIORITY[r.casePriority] : null,
+      suggestedSeverity: r.status === "FAILED" && r.failureClass !== "TEST_DEFINITION" ? SEVERITY_FOR_PRIORITY[r.casePriority] : null,
       reproduction: r.stepResults.filter((s) => s.status !== "SKIPPED").map((s) => s.action),
-      failedStep: r.stepResults.find((s) => s.status === "FAILED") ?? null,
+      failedStep: r.stepResults.find((s) => s.status === "FAILED" || s.status === "INCONCLUSIVE" || s.status === "BLOCKED" || s.status === "ERROR") ?? null,
     })),
   };
 }

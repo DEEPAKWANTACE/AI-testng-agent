@@ -8,6 +8,8 @@ import { db } from "@/lib/db";
 import { artifactPath } from "@/modules/artifacts/storage";
 import { decideApproval } from "@/modules/approvals/service";
 import type { Actor } from "@/modules/auth/service";
+import { verifyDefect } from "@/modules/defects/service";
+import { reviewBaseline } from "@/modules/visual-baselines/service";
 import { cancelRun, queueRun } from "@/modules/execution/runs";
 import type { ExecutableStep } from "@/modules/execution/steps";
 import { closeQueues, QUEUE_NAMES, queueConfig, runJobId, workerConnection } from "@/modules/jobs/queues";
@@ -71,6 +73,7 @@ beforeEach(async () => {
   await resetDatabase();
   demo.hits.clear();
   demo.setBroken(false);
+  demo.clearFaults();
   canary.requests.length = 0;
   delete process.env.EXECUTION_ALLOWED_ENVIRONMENTS;
   [engineer, lead] = await Promise.all([createUser("QA_ENGINEER"), createUser("QA_LEAD")]);
@@ -283,6 +286,356 @@ describe("executing an approved plan", () => {
     const third = await queueRunWithoutQueue(version.id);
     await processRun(third.id, config());
     expect((await loadRun(third.id)).results[0]).toMatchObject({ status: "PASSED", comparison: "FIXED", previousStatus: "FAILED" });
+  });
+});
+
+describe("verdicts and failure classes", () => {
+  const CLICK = (name: string): ExecutableStep => ({ kind: "CLICK", description: `Click ${name}`, params: { target: { by: "role", role: "link", name, exact: true } } });
+
+  it("reports only deterministic assertion failures and server errors as application failures", async () => {
+    const { run } = await approvedRun([
+      { title: "Wrong heading", steps: [NAV("/products"), HEADING("Catalogue")] },
+      { title: "Missing link", steps: [NAV("/products"), CLICK("Gift cards")] },
+      { title: "Ambiguous locator", steps: [NAV("/products"), { kind: "CLICK", description: "Any link", params: { target: { by: "css", value: "main a" } } }] },
+      { title: "Products list", steps: [NAV("/products"), HEADING("Products")] },
+    ]);
+    await processRun(run.id, config({ stepTimeoutMs: 1_500 }));
+    const done = await loadRun(run.id);
+    const result = (title: string) => done.results.find((r) => r.caseTitle === title)!;
+
+    expect(result("Wrong heading")).toMatchObject({ status: "FAILED", failureClass: "APPLICATION" });
+    expect(result("Wrong heading").defects).toHaveLength(1);
+    expect(result("Missing link")).toMatchObject({ status: "INCONCLUSIVE", failureClass: "TEST_DEFINITION" });
+    expect(result("Missing link").stepResults[1]).toMatchObject({ status: "INCONCLUSIVE", failureClass: "TEST_DEFINITION" });
+    expect(result("Ambiguous locator")).toMatchObject({ status: "INCONCLUSIVE", failureClass: "TEST_DEFINITION" });
+    expect(result("Products list").status).toBe("PASSED");
+    // Inconclusive and blocked cases never open defects.
+    for (const title of ["Missing link", "Ambiguous locator"]) expect(result(title).defects).toHaveLength(0);
+    expect(await db().defect.count()).toBe(1);
+
+    expect(done.status).toBe("FAILED");
+    expect(done.report).toMatchObject({ passed: 1, failed: 1, inconclusive: 2, blocked: 0 });
+    expect(done.report!.failureClasses).toEqual({ APPLICATION: 1, TEST_DEFINITION: 2 });
+  });
+
+  it("treats a missing element on a 5xx page as an application failure", async () => {
+    demo.setBroken(true);
+    const { run } = await approvedRun([{ title: "Open first product", steps: [NAV("/products"), CLICK("Trail runner shoes")] }]);
+    await processRun(run.id, config({ stepTimeoutMs: 1_500 }));
+    const [result] = (await loadRun(run.id)).results;
+    expect(result).toMatchObject({ status: "FAILED", failureClass: "APPLICATION" });
+    expect(result.suspectedCause).toContain("HTTP 500");
+  });
+
+  it("marks a run without failures but with unverifiable cases as inconclusive, not passed", async () => {
+    const { run } = await approvedRun([
+      { title: "Products list", steps: [NAV("/products"), HEADING("Products")] },
+      { title: "Missing link", steps: [NAV("/products"), CLICK("Gift cards")] },
+    ]);
+    await processRun(run.id, config({ stepTimeoutMs: 1_500 }));
+    const done = await loadRun(run.id);
+    expect(done.status).toBe("INCONCLUSIVE");
+    expect(done.report!.summary).toContain("1 inconclusive");
+    expect(await db().defect.count()).toBe(0);
+  });
+});
+
+describe("reproduction, flakiness and defect verification", () => {
+  const SORT_CHECK: CaseSpec = {
+    title: "Sorting keeps price order",
+    priority: "HIGH",
+    steps: [NAV("/products"), { kind: "SELECT", description: "Sort by name", params: { target: { by: "label", value: "Sort by" }, option: "Name" } }, { kind: "ASSERT", description: "Still price", params: { check: "valueEquals", target: { by: "label", value: "Sort by" }, expected: "Price" } }],
+  };
+
+  it("re-executes a failing case and opens a defect only with reproduction evidence", async () => {
+    const { run } = await approvedRun([SORT_CHECK]);
+    await processRun(run.id, config({ reproduceAttempts: 2 }));
+    const [result] = (await loadRun(run.id)).results;
+    expect(result).toMatchObject({ status: "FAILED", failureClass: "APPLICATION", attemptCount: 3, flaky: false });
+    expect((result.attempts as Array<{ status: string }>).map((a) => a.status)).toEqual(["FAILED", "FAILED", "FAILED"]);
+    expect(result.suspectedCause).toContain("Reproduced identically in 3 of 3 attempts");
+    // Evidence: a trace plus a screenshot of the failing step from each reproduction attempt.
+    expect(result.artifacts.map((a) => a.name).filter((n) => n.startsWith("Attempt"))).toEqual(["Attempt 2, step 3", "Attempt 3, step 3"]);
+    const defect = result.defects[0];
+    expect(defect).toMatchObject({ verification: "REPRODUCED", verifiedAt: null });
+    const evidence = defect.evidence as { signature: string; attempts: unknown[]; artifactIds: string[] };
+    expect(evidence.attempts).toHaveLength(3);
+    expect(evidence.signature).toContain("step 3");
+    expect(evidence.artifactIds).toHaveLength(3);
+  });
+
+  it("reproduces failures of cases that fill a new unique value on every attempt", async () => {
+    demo.setFault("profile-not-saved", true);
+    const { run } = await approvedRun([
+      {
+        title: "Display name is saved",
+        steps: [
+          NAV("/login"),
+          { kind: "FILL", description: "Email", params: { target: { by: "label", value: "Email" }, value: { secret: "DEMO_EMAIL" } } },
+          { kind: "FILL", description: "Password", params: { target: { by: "label", value: "Password" }, value: { secret: "DEMO_PASSWORD" } } },
+          { kind: "CLICK", description: "Sign in", params: { target: { by: "css", value: 'form[aria-label="Sign in"] button[type="submit"]' } } },
+          { kind: "FILL", description: "New name", params: { target: { by: "label", value: "Display name" }, value: { unique: "text", saveAs: "new_name" } } },
+          { kind: "CLICK", description: "Save", params: { target: { by: "role", role: "button", name: "Save profile" } } },
+          NAV("/account"),
+          { kind: "ASSERT", description: "Still there", params: { check: "valueEquals", target: { by: "label", value: "Display name" }, expectedVariable: "new_name" } },
+        ],
+      },
+    ]);
+    await processRun(run.id, config({ reproduceAttempts: 2 }));
+    const [result] = (await loadRun(run.id)).results;
+    expect(result).toMatchObject({ status: "FAILED", failureClass: "APPLICATION", attemptCount: 3, flaky: false });
+    expect(result.defects).toHaveLength(1);
+  });
+
+  it("reports a case that passes on retry as flaky and inconclusive, without a defect", async () => {
+    const { run } = await approvedRun([{ title: "Deal of the day", steps: [NAV("/deals"), HEADING("Deal of the day")] }]);
+    await processRun(run.id, config({ stepTimeoutMs: 1_000, reproduceAttempts: 2 }));
+    const done = await loadRun(run.id);
+    const [result] = done.results;
+    expect(result).toMatchObject({ status: "INCONCLUSIVE", flaky: true, attemptCount: 3 });
+    expect((result.attempts as Array<{ status: string }>).map((a) => a.status)).toEqual(["FAILED", "PASSED", "FAILED"]);
+    expect(result.suspectedCause).toMatch(/^Flaky: passed in 1 of 3 attempts/);
+    expect(result.defects).toHaveLength(0);
+    expect(done.status).toBe("INCONCLUSIVE");
+    expect(done.report).toMatchObject({ flaky: 1, failed: 0, inconclusive: 1 });
+  });
+
+  it("doesn't re-execute passing cases", async () => {
+    const { run } = await approvedRun([{ title: "Products list", steps: [NAV("/products"), HEADING("Products")] }]);
+    await processRun(run.id, config());
+    expect((await loadRun(run.id)).results[0]).toMatchObject({ status: "PASSED", attemptCount: 1 });
+    expect(demo.hits.get("/products")).toBe(1);
+  });
+
+  it("lets only reviewers confirm a reproduced defect, once, with a note", async () => {
+    const { run } = await approvedRun([SORT_CHECK]);
+    await processRun(run.id, config({ reproduceAttempts: 1 }));
+    const defect = await db().defect.findFirstOrThrow();
+    await expect(verifyDefect(engineer, defect.id, { decision: "CONFIRMED", note: "Looks real" })).rejects.toThrow();
+    const outsider = await createUser("QA_LEAD");
+    await expect(verifyDefect(outsider, defect.id, { decision: "CONFIRMED", note: "Looks real" })).rejects.toThrow(/not found/i);
+
+    await verifyDefect(lead, defect.id, { decision: "CONFIRMED", note: "Reproduced manually; select keeps the new value" });
+    expect(await db().defect.findUniqueOrThrow({ where: { id: defect.id } })).toMatchObject({ verification: "CONFIRMED", verifiedById: lead.id, status: "OPEN" });
+    await expect(verifyDefect(lead, defect.id, { decision: "NOT_CONFIRMED", note: "Changed my mind" })).rejects.toThrow(/already been reviewed/);
+    expect(await db().auditLog.count({ where: { action: "defect.verified", entityId: defect.id } })).toBe(1);
+  });
+
+  it("refuses to confirm a defect without multi-attempt evidence, and the database refuses unrecorded confirmations", async () => {
+    const app = await db().application.findUniqueOrThrow({ where: { id: applicationId } });
+    const bare = await db().defect.create({ data: { applicationId: app.id, title: "Hand-made", evidence: { attempts: [{}] } } });
+    await expect(verifyDefect(lead, bare.id, { decision: "CONFIRMED", note: "Trust me" })).rejects.toThrow(/at least two attempts/);
+    await verifyDefect(lead, bare.id, { decision: "NOT_CONFIRMED", note: "Couldn't reproduce" });
+    expect(await db().defect.findUniqueOrThrow({ where: { id: bare.id } })).toMatchObject({ verification: "NOT_CONFIRMED", status: "CLOSED" });
+    await expect(db().defect.create({ data: { applicationId: app.id, title: "Sneaky", verification: "CONFIRMED" } })).rejects.toThrow(/Defect_verification_recorded/);
+  });
+
+  it("scores isolated blips across runs as flakiness", async () => {
+    const { version } = await approvedRun([{ title: "Products list", steps: [NAV("/products"), HEADING("Products")] }]);
+    await db().testRun.deleteMany({});
+    const rates: Array<number | null> = [];
+    for (const broken of [false, true, false]) {
+      demo.setBroken(broken);
+      const r = await queueRunWithoutQueue(version.id);
+      await processRun(r.id, config({ stepTimeoutMs: 1_000, reproduceAttempts: 1 }));
+      rates.push((await loadRun(r.id)).results[0].flakeRate);
+    }
+    expect(rates).toEqual([null, null, 1]);
+  });
+});
+
+describe("data, business-rule, API contract and persistence checks", () => {
+  const testId = (value: string) => ({ by: "testId" as const, value });
+  const extract = (name: string, id: string): ExecutableStep => ({ kind: "EXTRACT", description: `Read ${name}`, params: { name, from: { source: "element", target: testId(id), property: "text" }, as: "number" } });
+  const calc = (expression: string): ExecutableStep => ({ kind: "ASSERT_CALC", description: expression, params: { expression } });
+  const fillCartWithCoupon: ExecutableStep[] = [
+    NAV("/products/1"),
+    { kind: "FILL", description: "Quantity 2", params: { target: { by: "label", value: "Quantity" }, value: { literal: "2" } } },
+    { kind: "CLICK", description: "Add", params: { target: { by: "role", role: "button", name: "Add to cart" } } },
+    NAV("/products/3"),
+    { kind: "CLICK", description: "Add", params: { target: { by: "role", role: "button", name: "Add to cart" } } },
+    { kind: "FILL", description: "Coupon", params: { target: { by: "label", value: "Coupon code" }, value: { literal: "SPRING10" } } },
+    { kind: "CLICK", description: "Apply", params: { target: { by: "role", role: "button", name: "Apply" } } },
+    extract("price_1", "price-1"), extract("qty_1", "qty-1"), extract("line_1", "line-total-1"), extract("line_3", "line-total-3"),
+    extract("subtotal", "subtotal"), extract("discount", "discount"), extract("total", "total"),
+  ];
+  const cartContract = {
+    type: "object" as const,
+    required: ["items", "subtotal", "discount", "total", "currency"],
+    properties: {
+      items: { type: "array" as const, minItems: 1, items: { type: "object" as const, required: ["productId", "price", "quantity", "lineTotal"], properties: { quantity: { type: "integer" as const, minimum: 1, maximum: 99 } } } },
+      total: { type: "number" as const, minimum: 0 },
+      currency: { type: "string" as const, enum: ["USD"] },
+    },
+  };
+
+  it("verifies pricing rules, the API contract and the page's own API calls", async () => {
+    const { run } = await approvedRun([
+      {
+        title: "Cart totals follow the pricing rules",
+        steps: [
+          ...fillCartWithCoupon,
+          calc("line_1 == price_1 * qty_1"),
+          calc("subtotal == line_1 + line_3"),
+          calc("discount == round(subtotal * 0.10, 2)"),
+          calc("total == subtotal - discount"),
+          { kind: "API_GET", description: "Cart API", params: { url: "/api/cart", saveAs: "cart_api" } },
+          { kind: "ASSERT_RESPONSE", description: "Contract", params: { response: "cart_api", status: 200, contentType: "application/json", contract: cartContract, equals: [{ pointer: "/coupon", value: "SPRING10" }] } },
+          { kind: "EXTRACT", description: "API total", params: { name: "api_total", from: { source: "response", response: "cart_api", pointer: "/total" }, as: "number" } },
+          calc("api_total == total"),
+          { kind: "ASSERT_RESPONSE", description: "Page synced the cart", params: { match: { method: "GET", urlContains: "/api/cart" }, status: 200, equals: [{ pointer: "/itemCount", value: 3 }] } },
+          { kind: "RELOAD", description: "Reload", params: {} },
+          extract("total_after_reload", "total"),
+          calc("total_after_reload == total"),
+        ],
+      },
+      { title: "Wrong discount rule", steps: [...fillCartWithCoupon, calc("discount == round(subtotal * 0.15, 2)")] },
+      { title: "Contract mismatch", steps: [NAV("/cart"), { kind: "API_GET", description: "Cart API", params: { url: "/api/cart", saveAs: "cart_api" } }, { kind: "ASSERT_RESPONSE", description: "EUR", params: { response: "cart_api", status: 201, contract: { type: "object", properties: { currency: { type: "string", enum: ["EUR"] } } } } }] },
+      { title: "Non-numeric extraction", steps: [NAV("/cart"), { kind: "EXTRACT", description: "Heading", params: { name: "h", from: { source: "element", target: { by: "role", role: "heading", name: "Your cart" }, property: "text" }, as: "number" } }] },
+      { title: "API call the page never makes", steps: [NAV("/cart"), { kind: "ASSERT_RESPONSE", description: "Nothing", params: { match: { urlContains: "/api/never" }, status: 200 } }] },
+      { title: "API_GET before opening the app", steps: [{ kind: "API_GET", description: "Too early", params: { url: "/api/cart", saveAs: "c" } }] },
+    ]);
+    await processRun(run.id, config({ stepTimeoutMs: 1_500, reproduceAttempts: 1 }));
+    const done = await loadRun(run.id);
+    const result = (title: string) => done.results.find((r) => r.caseTitle === title)!;
+
+    const ok = result("Cart totals follow the pricing rules");
+    expect(ok.status, ok.errorMessage ?? "").toBe("PASSED");
+    const actuals = ok.stepResults.sort((a, b) => a.position - b.position).map((s) => s.actualResult);
+    expect(actuals).toContain("{total} = 177.3");
+    expect(actuals).toContain("19.7 == 19.7");
+    expect(actuals.some((a) => /^GET \/api\/cart → 200 \(application\/json/.test(a ?? ""))).toBe(true);
+    expect(actuals.some((a) => a?.startsWith("GET /api/cart → 200: status 200, /itemCount = 3 OK"))).toBe(true);
+
+    const wrong = result("Wrong discount rule");
+    expect(wrong).toMatchObject({ status: "FAILED", failureClass: "APPLICATION" });
+    expect(wrong.stepResults.find((s) => s.status === "FAILED")).toMatchObject({ expectedResult: "discount == round(subtotal * 0.15, 2)", actualResult: "19.7 == 29.55 is false" });
+
+    const contract = result("Contract mismatch");
+    expect(contract).toMatchObject({ status: "FAILED", failureClass: "APPLICATION" });
+    expect(contract.stepResults.find((s) => s.status === "FAILED")!.actualResult).toBe('status 200; /currency: expected one of "EUR"');
+
+    expect(result("Non-numeric extraction")).toMatchObject({ status: "INCONCLUSIVE", failureClass: "TEST_DEFINITION" });
+    expect(result("API call the page never makes")).toMatchObject({ status: "INCONCLUSIVE", failureClass: "TEST_DEFINITION" });
+    expect(result("API_GET before opening the app")).toMatchObject({ status: "INCONCLUSIVE", failureClass: "TEST_DEFINITION" });
+    expect(canary.requests).toEqual([]);
+  });
+
+  it("checks that a change persists, using a unique value", async () => {
+    const login: ExecutableStep[] = [
+      NAV("/login"),
+      { kind: "FILL", description: "Email", params: { target: { by: "label", value: "Email" }, value: { secret: "DEMO_EMAIL" } } },
+      { kind: "FILL", description: "Password", params: { target: { by: "label", value: "Password" }, value: { secret: "DEMO_PASSWORD" } } },
+      { kind: "CLICK", description: "Sign in", params: { target: { by: "css", value: 'form[aria-label="Sign in"] button[type="submit"]' } } },
+    ];
+    const { run } = await approvedRun([
+      {
+        title: "Display name is saved",
+        steps: [
+          ...login,
+          { kind: "FILL", description: "New name", params: { target: { by: "label", value: "Display name" }, value: { unique: "text", saveAs: "new_name" } } },
+          { kind: "CLICK", description: "Save", params: { target: { by: "role", role: "button", name: "Save profile" } } },
+          { kind: "ASSERT", description: "Saved", params: { check: "visible", target: { by: "role", role: "status" } } },
+          NAV("/account"),
+          { kind: "ASSERT", description: "Still there", params: { check: "valueEquals", target: { by: "label", value: "Display name" }, expectedVariable: "new_name" } },
+        ],
+      },
+    ]);
+    await processRun(run.id, config());
+    const [result] = (await loadRun(run.id)).results;
+    expect(result.status, result.errorMessage ?? "").toBe("PASSED");
+    expect(result.stepResults.find((s) => s.position === 4)!.actualResult).toMatch(/^Filled unique text \{new_name\} = "qa-[0-9a-f]{8}"$/);
+  });
+});
+
+describe("visual baselines", () => {
+  const VISUAL = (name: string, extra: Record<string, unknown> = {}): ExecutableStep => ({ kind: "ASSERT_VISUAL", description: `Looks like ${name}`, params: { name, target: { by: "css", value: "main ul" }, ...extra } });
+  const cases: CaseSpec[] = [
+    { title: "Product list looks right", steps: [NAV("/products"), VISUAL("product-list")] },
+    { title: "Masked product list", steps: [NAV("/products"), VISUAL("masked-list", { target: { by: "css", value: "main" }, mask: [{ by: "css", value: "main ul" }] })] },
+  ];
+  const result = async (runId: string, title: string) => (await loadRun(runId)).results.find((r) => r.caseTitle === title)!;
+
+  it("needs a reviewer-approved baseline, then detects visual changes as reproduced application failures", async () => {
+    const { version } = await approvedRun(cases);
+    await db().testRun.deleteMany({});
+
+    // 1. No baseline yet: inconclusive, and the capture becomes a pending candidate.
+    const first = await queueRunWithoutQueue(version.id);
+    await processRun(first.id, config({ reproduceAttempts: 1 }));
+    const initial = await result(first.id, "Product list looks right");
+    expect(initial).toMatchObject({ status: "INCONCLUSIVE", failureClass: "TEST_DEFINITION" });
+    expect(initial.suspectedCause).toContain("no approved visual baseline");
+    expect(initial.defects).toHaveLength(0);
+    expect(initial.stepResults.find((s) => s.position === 1)!.artifacts.length).toBeGreaterThanOrEqual(2); // capture + step screenshot
+    const candidates = await db().visualBaseline.findMany({ where: { status: "PENDING" }, orderBy: { name: "asc" } });
+    expect(candidates.map((c) => c.name)).toEqual(["masked-list", "product-list"]);
+
+    // 2. Review: reviewers only, bound to the image hash shown.
+    const candidate = candidates.find((c) => c.name === "product-list")!;
+    await expect(reviewBaseline(engineer, candidate.id, { decision: "APPROVED", expectedHash: candidate.sha256, note: null })).rejects.toThrow();
+    await expect(reviewBaseline(lead, candidate.id, { decision: "APPROVED", expectedHash: "0".repeat(64), note: null })).rejects.toThrow(/isn't the one you reviewed/);
+    for (const c of candidates) await reviewBaseline(lead, c.id, { decision: "APPROVED", expectedHash: c.sha256, note: "Matches the design" });
+    expect(await db().auditLog.count({ where: { action: "baseline.approved" } })).toBe(2);
+
+    // 3. Unchanged page: passes.
+    const second = await queueRunWithoutQueue(version.id);
+    await processRun(second.id, config());
+    expect(await result(second.id, "Product list looks right")).toMatchObject({ status: "PASSED", attemptCount: 1 });
+
+    // 4. Restyled list: reproduced application failure with a diff image; masked check unaffected.
+    demo.setFault("restyled-products", true);
+    const third = await queueRunWithoutQueue(version.id);
+    await processRun(third.id, config({ reproduceAttempts: 1 }));
+    const changed = await result(third.id, "Product list looks right");
+    expect(changed).toMatchObject({ status: "FAILED", failureClass: "APPLICATION", attemptCount: 2 });
+    const failedStep = changed.stepResults.find((s) => s.status === "FAILED")!;
+    expect(failedStep.expectedResult).toContain('baseline "product-list"');
+    const names = (await db().artifact.findMany({ where: { stepResultId: failedStep.id } })).map((a) => a.name);
+    expect(names).toEqual(expect.arrayContaining(['Visual capture "product-list"', 'Visual diff "product-list"']));
+    expect(failedStep.actualResult).toMatch(/% of pixels differ/);
+    expect(changed.defects).toHaveLength(1);
+    expect((await result(third.id, "Masked product list")).status).toBe("PASSED");
+    demo.clearFaults();
+  });
+
+  it("refuses a baseline whose stored image no longer matches the approved hash", async () => {
+    const { version } = await approvedRun([cases[0]]);
+    await db().testRun.deleteMany({});
+    const first = await queueRunWithoutQueue(version.id);
+    await processRun(first.id, config({ reproduceAttempts: 1 }));
+    const candidate = await db().visualBaseline.findFirstOrThrow({ where: { status: "PENDING" } });
+    await reviewBaseline(lead, candidate.id, { decision: "APPROVED", expectedHash: candidate.sha256, note: null });
+
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(artifactPath(candidate.storageKey), Buffer.from("tampered"));
+    const second = await queueRunWithoutQueue(version.id);
+    await processRun(second.id, config({ reproduceAttempts: 1 }));
+    const r = await result(second.id, "Product list looks right");
+    expect(r).toMatchObject({ status: "INCONCLUSIVE", failureClass: "TEST_DEFINITION" });
+    expect(r.errorMessage).toContain("doesn't match the image that was approved");
+  });
+
+  it("keeps a single approved baseline per key, and the database enforces it", async () => {
+    const { version } = await approvedRun([cases[0]]);
+    await db().testRun.deleteMany({});
+    const a = await queueRunWithoutQueue(version.id);
+    await processRun(a.id, config({ reproduceAttempts: 1 }));
+    const firstCandidate = await db().visualBaseline.findFirstOrThrow({ where: { status: "PENDING" } });
+    await reviewBaseline(lead, firstCandidate.id, { decision: "APPROVED", expectedHash: firstCandidate.sha256, note: null });
+
+    demo.setFault("restyled-products", true);
+    const b = await queueRunWithoutQueue(version.id);
+    await processRun(b.id, config({ reproduceAttempts: 1 }));
+    demo.clearFaults();
+    // A failed comparison never proposes a replacement: only checks without an approved baseline do.
+    expect(await db().visualBaseline.count({ where: { status: "PENDING" } })).toBe(0);
+    // A replacement candidate (as if captured for an intentional redesign) supersedes the old one on approval.
+    const second = await db().visualBaseline.create({ data: { ...firstCandidate, id: undefined, status: "PENDING", storageKey: `${firstCandidate.storageKey}.copy`, reviewerId: null, reviewedAt: null, reviewNote: null, createdAt: undefined } });
+    await reviewBaseline(lead, second.id, { decision: "APPROVED", expectedHash: second.sha256, note: null });
+    expect((await db().visualBaseline.findMany({ where: { caseKey: firstCandidate.caseKey } })).map((x) => x.status).sort()).toEqual(["APPROVED", "SUPERSEDED"]);
+    await expect(db().visualBaseline.update({ where: { id: firstCandidate.id }, data: { status: "APPROVED" } })).rejects.toThrow();
+    await expect(reviewBaseline(lead, second.id, { decision: "REJECTED", expectedHash: second.sha256, note: null })).rejects.toThrow(/already been reviewed/);
   });
 });
 

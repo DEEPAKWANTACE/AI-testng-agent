@@ -14,7 +14,7 @@ export function listTestRuns(actor: Actor) {
     take: 100,
     include: {
       planVersion: { select: { id: true, version: true, suite: { select: { id: true, name: true, kind: true, application: { select: { name: true } } } } } },
-      report: { select: { passed: true, failed: true, errored: true, blocked: true, regressions: true } },
+      report: { select: { passed: true, failed: true, errored: true, blocked: true, inconclusive: true, regressions: true } },
     },
   });
 }
@@ -36,7 +36,7 @@ export async function getRunReport(actor: Actor, runId: string) {
   if (!data) return null;
   const role = await getProjectRole(actor, data.planVersion.suite.application.projectId);
   if (!can(actor.role, role, "project.view")) return null;
-  return { ...data, permissions: { manage: can(actor.role, role, "run.manage") } };
+  return { ...data, permissions: { manage: can(actor.role, role, "run.manage"), verifyDefects: can(actor.role, role, "defect.verify") } };
 }
 
 export function listReports(actor: Actor) {

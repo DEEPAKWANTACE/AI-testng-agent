@@ -13,9 +13,13 @@ export function filterResults(data: ReportData, filters: ReportFilters) {
   );
 }
 
+/** Stated on every report: results are evidence about the executed cases, nothing more. */
+export const REPORT_LIMITATIONS =
+  "These results cover only the approved test cases that were executed against this target at this time. They do not establish complete coverage or guarantee the application is free of defects. FAILED means a deterministic check didn't hold; INCONCLUSIVE means the evidence doesn't support a verdict; BLOCKED means the case couldn't run.";
+
 /** Structured report (also the JSON download). Evidence is linked, never embedded. */
 export function reportJson(data: ReportData, origin: string, filters: ReportFilters = {}) {
-  const coverage = (data.report?.coverage ?? { features: [], uncovered: [] }) as { features: unknown[]; uncovered: string[] };
+  const coverage = (data.report?.coverage ?? { features: [], uncovered: [] }) as { features: unknown[]; uncovered: string[]; inventory?: { known: number; byLevel: Record<string, number>; notVerified: string[]; disclaimer: string } | null };
   const evidence = (id: string) => `${origin}/api/artifacts/${id}`;
   return {
     generatedAt: new Date().toISOString(),
@@ -44,11 +48,14 @@ export function reportJson(data: ReportData, origin: string, filters: ReportFilt
       approvedAt: data.planVersion.approvals[0]?.decidedAt?.toISOString() ?? null,
       approvedHash: data.planVersion.approvals[0]?.decidedHash ?? null,
     },
+    limitations: REPORT_LIMITATIONS,
     totals: {
       passed: data.report?.passed ?? 0,
-      failed: (data.report?.failed ?? 0) + (data.report?.errored ?? 0),
+      failed: data.report?.failed ?? 0,
       blocked: data.report?.blocked ?? 0,
+      inconclusive: (data.report?.inconclusive ?? 0) + (data.report?.errored ?? 0),
       skipped: data.report?.skipped ?? 0,
+      flaky: data.report?.flaky ?? 0,
       regressions: data.report?.regressions ?? 0,
       fixed: data.report?.fixed ?? 0,
     },
@@ -61,12 +68,17 @@ export function reportJson(data: ReportData, origin: string, filters: ReportFilt
       category: r.category,
       priority: r.casePriority,
       status: r.status,
+      failureClass: r.failureClass,
       comparison: r.comparison,
       previousStatus: r.previousStatus,
       suggestedSeverity: r.suggestedSeverity,
       error: r.errorMessage,
       suspectedCause: r.suspectedCause ? { label: SUSPECTED_CAUSE_LABEL, confirmed: false, text: r.suspectedCause } : null,
       reproductionSteps: r.reproduction,
+      attempts: r.attempts ?? [],
+      flaky: r.flaky,
+      flakeRate: r.flakeRate,
+      defects: r.defects.map((d) => ({ severity: d.severity, verification: d.verification, verifiedAt: d.verifiedAt?.toISOString() ?? null })),
       steps: r.stepResults.map((s) => ({
         position: s.position + 1,
         action: s.action,
@@ -122,16 +134,18 @@ body{font:14px/1.5 system-ui,sans-serif;color:#18181b;max-width:960px;margin:0 a
 .meta{color:#71717a;font-size:12px;margin:2px 0}.tiles{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0}.tile{border:1px solid #e4e4e7;border-radius:8px;padding:10px 14px;min-width:90px}.tile b{display:block;font-size:22px}
 table{border-collapse:collapse;width:100%}th,td{border-bottom:1px solid #e4e4e7;padding:6px 8px;text-align:left;font-size:13px;vertical-align:top}.ea th{width:90px;color:#71717a}
 .case{border:1px solid #e4e4e7;border-radius:8px;padding:12px 14px;margin:10px 0}.err{color:#b91c1c;font-size:13px}.cause{background:#fffbeb;border:1px solid #fde68a;padding:6px 8px;border-radius:6px;font-size:13px}
-.b{display:inline-block;border-radius:4px;padding:1px 6px;font-size:11px;font-weight:600;background:#f4f4f5}.b-passed{background:#dcfce7;color:#166534}.b-failed,.b-error{background:#fee2e2;color:#991b1b}.b-blocked{background:#fef3c7;color:#92400e}
+.b{display:inline-block;border-radius:4px;padding:1px 6px;font-size:11px;font-weight:600;background:#f4f4f5}.b-passed{background:#dcfce7;color:#166534}.b-failed,.b-error{background:#fee2e2;color:#991b1b}.b-blocked,.b-inconclusive{background:#fef3c7;color:#92400e}.muted{color:#71717a;font-size:12px}
 </style></head><body>
 <h1>${e(r.plan.suite)} v${r.plan.version} ${badge(r.run.status)}</h1>
 <p class="meta">${e(r.plan.project)} / ${e(r.plan.application)} · ${e(r.run.target)} · ${e(r.run.environment ?? "")} · run ${e(r.run.id)} · finished ${e(r.run.finishedAt ?? "—")}</p>
 <p class="meta">Plan hash ${e(r.plan.contentHash)} · approved by ${e(r.plan.approvedBy ?? "—")} at ${e(r.plan.approvedAt ?? "—")}</p>
 ${r.run.blockedReason ? `<p class="err">Blocked before execution: ${e(r.run.blockedReason)}</p>` : ""}${r.run.error ? `<p class="err">${e(r.run.error)}</p>` : ""}
-<div class="tiles"><div class="tile">Passed<b>${r.totals.passed}</b></div><div class="tile">Failed<b>${r.totals.failed}</b></div><div class="tile">Blocked<b>${r.totals.blocked}</b></div><div class="tile">Skipped<b>${r.totals.skipped}</b></div><div class="tile">Regressions<b>${r.totals.regressions}</b></div><div class="tile">Fixed<b>${r.totals.fixed}</b></div></div>
+<p class="muted">${e(r.limitations)}</p>
+<div class="tiles"><div class="tile">Passed<b>${r.totals.passed}</b></div><div class="tile">Failed<b>${r.totals.failed}</b></div><div class="tile">Blocked<b>${r.totals.blocked}</b></div><div class="tile">Inconclusive<b>${r.totals.inconclusive}</b></div><div class="tile">Skipped<b>${r.totals.skipped}</b></div><div class="tile">Regressions<b>${r.totals.regressions}</b></div><div class="tile">Fixed<b>${r.totals.fixed}</b></div></div>
 <h2>Feature coverage</h2>
 <table><tr><th>Feature</th><th>Cases</th><th>Passed</th><th>Failed</th><th>Blocked</th><th>Pass rate</th></tr>${coverage}</table>
 ${r.coverage.uncovered.length ? `<p class="meta">Features without tests: ${e(r.coverage.uncovered.join(", "))}</p>` : ""}
+${r.coverage.inventory ? `<p class="meta">Known inventory: ${r.coverage.inventory.byLevel.VERIFIED} of ${r.coverage.inventory.known} items verified by this run.${r.coverage.inventory.notVerified.length ? ` Not verified: ${e(r.coverage.inventory.notVerified.slice(0, 30).join(", "))}.` : ""} ${e(r.coverage.inventory.disclaimer)}</p>` : ""}
 <h2>Results${Object.values(filters).some(Boolean) ? " (filtered)" : ""}</h2>
 ${rows || '<p class="meta">No results.</p>'}
 <p class="meta">Suspected causes are heuristic hints and have not been confirmed.</p>

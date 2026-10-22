@@ -1,6 +1,7 @@
 import type { ExecutableStep, Locator } from "@/modules/execution/steps";
 import type { FormElement } from "@/modules/discovery/page-elements";
 import type { GeneratedCase } from "./schema";
+import { INVENTORY_FEATURES, type InventoryEndpoint } from "./inventory-context";
 import type { FeatureContext, GenerationContext } from "./prompt";
 
 /**
@@ -245,6 +246,134 @@ export function heuristicGenerate(context: GenerationContext): GeneratedCase[] {
           coverage: { requirements: ["Users can navigate between sections"] },
         });
       }
+    }
+  }
+  return [...cases, ...inventoryCases(context)];
+}
+
+/**
+ * Cases grounded in the inventory. Only facts a source states are turned into checks: a
+ * documented 2xx response and its schema, a documented 401/403 for signed-out callers, a
+ * documented 400/422 for out-of-range parameters, a route a source marks as protected.
+ * Only GET requests are made, and only to endpoints without path parameters, so generated
+ * cases never change data. Prose requirements and workflows aren't turned into checks here
+ * (that needs judgement), only by an LLM provider, and only as reviewable proposals.
+ */
+export function inventoryCases(context: GenerationContext): GeneratedCase[] {
+  const inventory = context.inventory;
+  if (!inventory) return [];
+  const cases: GeneratedCase[] = [];
+  const login = loginSteps(context);
+  const landing = new URL(context.application.authorizedUrl).pathname || "/";
+  const open: ExecutableStep = { kind: "NAVIGATE", description: "Open the application", params: { url: landing } };
+  const statusOf = (endpoint: InventoryEndpoint, test: (code: number) => boolean) =>
+    Object.keys(endpoint.responses).map(Number).filter((code) => Number.isInteger(code) && test(code)).sort((a, b) => a - b)[0];
+
+  for (const endpoint of inventory.endpoints) {
+    if (endpoint.method !== "GET" || endpoint.path.includes(":")) continue;
+    const ok = statusOf(endpoint, (c) => c >= 200 && c < 300);
+    const contract = ok !== undefined ? endpoint.responses[String(ok)]?.contract ?? null : null;
+    const needsLogin = endpoint.protected === true;
+    const prefix = needsLogin ? login : [];
+    const required = endpoint.parameters.filter((p) => p.required && p.in !== "header" && p.in !== "cookie");
+
+    if (ok !== undefined && prefix && required.length === 0) {
+      cases.push({
+        title: `${endpoint.key} returns ${ok}${contract ? " matching its documented schema" : ""}`.slice(0, 200),
+        feature: INVENTORY_FEATURES.api,
+        category: "POSITIVE",
+        priority: "HIGH",
+        prerequisites: needsLogin ? ["A test account exists and its credentials are stored as secret references"] : ["The application is reachable"],
+        steps: [
+          ...prefix,
+          open,
+          { kind: "API_GET", description: `Request ${endpoint.key}`, params: { url: endpoint.path, saveAs: "response" } },
+          {
+            kind: "ASSERT_RESPONSE",
+            description: contract ? "The response has the documented status and schema" : "The response has the documented status",
+            params: { response: "response", status: ok, ...(contract ? { contentType: "json", contract } : {}) },
+          },
+        ],
+        expectedResult: `${endpoint.key} responds with ${ok}${contract ? " and a body matching the API specification" : ""}.`,
+        coverage: { requirements: [endpoint.key], notes: "Derived from the API specification" },
+      });
+    }
+
+    const denied = statusOf(endpoint, (c) => c === 401 || c === 403);
+    if (needsLogin && denied !== undefined && required.length === 0) {
+      cases.push({
+        title: `${endpoint.key} refuses signed-out requests`.slice(0, 200),
+        feature: INVENTORY_FEATURES.access,
+        category: "PERMISSION",
+        priority: "CRITICAL",
+        prerequisites: ["The browser is not signed in"],
+        steps: [
+          open,
+          { kind: "API_GET", description: `Request ${endpoint.key} without signing in`, params: { url: endpoint.path, saveAs: "response" } },
+          { kind: "ASSERT_RESPONSE", description: "Access is refused", expected: "401 or 403", params: { response: "response", status: { min: 401, max: 403 } } },
+        ],
+        expectedResult: "Unauthenticated callers are refused with 401 or 403, as documented.",
+        coverage: { requirements: [endpoint.key, `${endpoint.key} requires authentication`], notes: "Derived from the API specification" },
+      });
+    }
+
+    // Boundaries of documented query parameters: at the limit is accepted, past it is refused.
+    const rejects = statusOf(endpoint, (c) => c === 400 || c === 422);
+    if (ok === undefined || (needsLogin && !login)) continue;
+    for (const param of endpoint.parameters.filter((p) => p.in === "query" && p.schema).slice(0, 3)) {
+      const schema = param.schema!;
+      const bounds: Array<{ value: string; accepted: boolean; label: string }> = [];
+      if ((schema.type === "integer" || schema.type === "number") && schema.maximum !== undefined) {
+        bounds.push({ value: String(schema.maximum), accepted: true, label: `${param.name}=${schema.maximum} (maximum)` });
+        if (rejects !== undefined) bounds.push({ value: String(schema.type === "integer" ? schema.maximum + 1 : schema.maximum + 0.5), accepted: false, label: `${param.name} above its maximum` });
+      }
+      if ((schema.type === "integer" || schema.type === "number") && schema.minimum !== undefined) {
+        bounds.push({ value: String(schema.minimum), accepted: true, label: `${param.name}=${schema.minimum} (minimum)` });
+        if (rejects !== undefined) bounds.push({ value: String(schema.type === "integer" ? schema.minimum - 1 : schema.minimum - 0.5), accepted: false, label: `${param.name} below its minimum` });
+      }
+      if (schema.type === "string" && schema.maxLength !== undefined && schema.maxLength <= 500) {
+        bounds.push({ value: "a".repeat(schema.maxLength), accepted: true, label: `${param.name} at its maximum length (${schema.maxLength})` });
+        if (rejects !== undefined) bounds.push({ value: "a".repeat(schema.maxLength + 1), accepted: false, label: `${param.name} past its maximum length` });
+      }
+      for (const bound of bounds) {
+        const url = `${endpoint.path}?${new URLSearchParams({ [param.name]: bound.value })}`;
+        if (url.length > 2048) continue;
+        cases.push({
+          title: `${endpoint.key}: ${bound.label} is ${bound.accepted ? "accepted" : "refused"}`.slice(0, 200),
+          feature: INVENTORY_FEATURES.api,
+          category: bound.accepted ? "BOUNDARY" : "NEGATIVE",
+          priority: "MEDIUM",
+          prerequisites: needsLogin ? ["A test account exists and its credentials are stored as secret references"] : ["The application is reachable"],
+          steps: [
+            ...(needsLogin ? login! : []),
+            open,
+            { kind: "API_GET", description: `Request with ${bound.label}`, params: { url, saveAs: "response" } },
+            { kind: "ASSERT_RESPONSE", description: bound.accepted ? "The request is accepted" : "The request is refused as invalid", params: { response: "response", status: bound.accepted ? ok : { min: 400, max: 422 } } },
+          ],
+          expectedResult: bound.accepted ? `A value at the documented limit is accepted (${ok}).` : "A value past the documented limit is refused with a 4xx validation error.",
+          coverage: { requirements: [endpoint.key, `${endpoint.key} ${param.name} limits`], notes: "Derived from the API specification" },
+        });
+      }
+    }
+  }
+
+  // Routes a source marks as protected: signed-out visitors end up at the sign-in page.
+  const loginPath = context.login?.path;
+  if (login && loginPath) {
+    for (const route of inventory.routes.filter((r) => r.protected === true && !r.key.includes(":") && r.key !== loginPath).slice(0, 15)) {
+      cases.push({
+        title: `Signed-out visitors can't open ${route.key}`.slice(0, 200),
+        feature: INVENTORY_FEATURES.access,
+        category: "PERMISSION",
+        priority: "CRITICAL",
+        prerequisites: ["The browser is not signed in"],
+        steps: [
+          { kind: "NAVIGATE", description: `Open ${route.key} without signing in`, params: { url: route.key } },
+          { kind: "ASSERT", description: "The visitor is sent to sign in", expected: `URL contains ${loginPath}`, params: { check: "urlContains", expected: loginPath } },
+        ],
+        expectedResult: "The protected page isn't shown to signed-out visitors; they're redirected to sign in.",
+        coverage: { requirements: [route.key, `${route.key} requires authentication`], notes: "The source marks this route as protected" },
+      });
     }
   }
   return cases;

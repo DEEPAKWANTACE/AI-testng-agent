@@ -30,6 +30,8 @@ export default defineConfig({
             // Isolated Redis database and queue prefix for tests (global setup flushes db 15 only).
             REDIS_URL: process.env.TEST_REDIS_URL ?? "redis://127.0.0.1:6379/15",
             QUEUE_PREFIX: "qa-test",
+            // Fixed throwaway key for the encrypted-credential store.
+            SECRETS_ENCRYPTION_KEY: "dGVzdC1rZXktdGVzdC1rZXktdGVzdC1rZXktMTIzNDU=",
           },
           globalSetup: ["tests/helpers/global-setup.ts"],
           setupFiles: ["tests/helpers/next-mocks.ts"],

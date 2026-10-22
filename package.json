@@ -24,7 +24,8 @@
     "worker:jobs": "tsx --conditions=react-server src/worker/jobs/main.ts",
     "workers": "node scripts/run-workers.mjs",
     "deploy:prepare": "prisma migrate deploy && tsx --conditions=react-server scripts/bootstrap.ts",
-    "workers:live": "node scripts/live-workers.mjs"
+    "workers:live": "node scripts/live-workers.mjs",
+    "benchmark": "tsx --conditions=react-server scripts/benchmark.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1152.0",
@@ -34,16 +35,20 @@
     "ioredis": "6.0.0",
     "next": "16.4.1",
     "pg": "8.23.1",
+    "pixelmatch": "^7.1.0",
     "playwright": "1.64.1",
+    "pngjs": "^7.0.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "server-only": "^0.0.1",
+    "yaml": "^2.9.1",
     "zod": "^4.6.7"
   },
   "devDependencies": {
     "@tailwindcss/turbopack": "^4",
     "@types/node": "24.19.2",
     "@types/pg": "8.23.1",
+    "@types/pngjs": "^6.0.5",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "dotenv": "^18.0.8",

@@ -28,6 +28,7 @@ const statusTones: Record<string, Tone> = {
   CANCELLED: "neutral",
   SKIPPED: "neutral",
   BLOCKED: "warning",
+  INCONCLUSIVE: "warning",
   SUPERSEDED: "neutral",
   OPEN: "danger",
   IN_PROGRESS: "info",

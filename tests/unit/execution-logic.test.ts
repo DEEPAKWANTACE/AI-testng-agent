@@ -14,6 +14,8 @@ describe("regression comparison", () => {
     ["FAILED", "FAILED", "STILL_FAILING"],
     ["BLOCKED", "FAILED", "UNCHANGED"],
     ["PASSED", "BLOCKED", "UNCHANGED"],
+    ["PASSED", "INCONCLUSIVE", "UNCHANGED"],
+    ["INCONCLUSIVE", "FAILED", "UNCHANGED"],
   ] as Array<[ResultStatus | null, ResultStatus, string]>)("%s → %s is %s", (previous, current, expected) => {
     expect(compareStatus(previous, current)).toBe(expected);
   });
@@ -23,7 +25,9 @@ describe("run status", () => {
   it.each([
     [["PASSED", "PASSED"], "PASSED"],
     [["PASSED", "FAILED"], "FAILED"],
-    [["PASSED", "ERROR", "BLOCKED"], "FAILED"],
+    [["PASSED", "FAILED", "INCONCLUSIVE"], "FAILED"],
+    [["PASSED", "INCONCLUSIVE", "BLOCKED"], "INCONCLUSIVE"],
+    [["PASSED", "ERROR"], "INCONCLUSIVE"],
     [["PASSED", "BLOCKED"], "BLOCKED"],
     [["PASSED", "SKIPPED"], "BLOCKED"],
     [[], "BLOCKED"],

@@ -85,15 +85,20 @@ async function ApplicationDetail({ params }: { params: PageProps<"/applications/
           </>
         }
         actions={
-          permissions.delete ? (
-            <ActionButton
-              action={deleteApplication.bind(null, application.id)}
-              variant="danger"
-              confirmMessage={`Delete "${application.name}" with its secret references, features, suites and runs?`}
-            >
-              Delete
-            </ActionButton>
-          ) : null
+          <div className="flex flex-wrap items-start gap-2">
+            <LinkButton href={`/applications/${application.id}/inventory`} variant="secondary">
+              Inventory &amp; coverage
+            </LinkButton>
+            {permissions.delete ? (
+              <ActionButton
+                action={deleteApplication.bind(null, application.id)}
+                variant="danger"
+                confirmMessage={`Delete "${application.name}" with its secret references, features, suites and runs?`}
+              >
+                Delete
+              </ActionButton>
+            ) : null}
+          </div>
         }
       />
       <div className="grid gap-6 lg:grid-cols-3">

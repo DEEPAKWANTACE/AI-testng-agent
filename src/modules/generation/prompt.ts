@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { PageElements } from "@/modules/discovery/page-elements";
+import { INVENTORY_FEATURES, type InventoryContext } from "./inventory-context";
 
 /**
  * Prompt construction. Website content is untrusted: it is passed as JSON *data* inside a
@@ -21,6 +22,8 @@ export type GenerationContext = {
   secretNames: string[];
   /** Discovery login, if configured: lets generated cases sign in using secret references. */
   login?: { path: string; usernameSelector: string; usernameSecret: string; passwordSecret: string } | null;
+  /** Known routes, endpoints, requirements, workflows and roles (see inventory-context.ts). */
+  inventory?: InventoryContext | null;
 };
 
 export type PromptMessages = { system: string; user: string; hash: string };
@@ -56,7 +59,17 @@ export function buildPrompt(context: GenerationContext): PromptMessages {
     "",
     "Rules:",
     "- For each feature, cover these categories where they apply: END_TO_END, POSITIVE, NEGATIVE, BOUNDARY, PERMISSION, REGRESSION.",
-    "- Steps may only use these actions: NAVIGATE {url}, CLICK {target}, FILL {target, value}, SELECT {target, option}, WAIT {for, target|urlContains|ms}, ASSERT {check, target?, expected?}.",
+    "- Steps may only use these actions: NAVIGATE {url}, CLICK {target}, FILL {target, value}, SELECT {target, option}, WAIT {for, target|urlContains|ms}, ASSERT {check, target?, expected?|expectedVariable?}, RELOAD {},",
+    "  EXTRACT {name, from: {source: element, target, property: text|value} | {source: response, response, pointer} | {source: url, part}, as: text|number},",
+    "  ASSERT_CALC {expression, tolerance?} (e.g. \"round(subtotal * 0.9, 2) == total\" using only EXTRACTed variables, + - * / %, round/floor/ceil/abs/min/max),",
+    "  API_GET {url, saveAs} (read-only GET to the application, after a NAVIGATE), ASSERT_RESPONSE {response | match: {method?, urlContains}, status?, contentType?, contract?, equals?},",
+    "  ASSERT_VISUAL {name, target?, mask?} (compares with a reviewer-approved baseline).",
+    "- Verify business rules with an independent calculation: EXTRACT the inputs and the application's result, then ASSERT_CALC the rule. Never assert a number you computed yourself as a literal.",
+    "- Check persistence with FILL {unique: text|email|number, saveAs}, saving, then RELOAD or NAVIGATE back and ASSERT with expectedVariable.",
+    "- API requests must be GET only. Never call endpoints that create, change or delete data.",
+    "- When INVENTORY is given: put the inventory keys a case covers (e.g. \"REQ-2\", \"GET /api/cart\", \"/account\") in coverage.requirements; use the documented response schemas as ASSERT_RESPONSE contracts;",
+    `  cases for API endpoints, access control, business rules and workflows may use the features "${INVENTORY_FEATURES.api}", "${INVENTORY_FEATURES.access}", "${INVENTORY_FEATURES.rules}" and "${INVENTORY_FEATURES.workflows}".`,
+    "- Only assert what the requirements, specification or page data state. If an expected value isn't stated, don't invent one.",
     "- Targets are structured locators: {by: role|label|text|placeholder|testId|css, ...}. Prefer role and label locators taken from the page data.",
     "- NAVIGATE urls must be paths on the application (e.g. \"/cart\"). Never use other hosts.",
     "- Fill values are {\"literal\": \"...\"} or {\"secret\": \"NAME\"} using only these secret names: " + (context.secretNames.join(", ") || "(none)") + ".",
@@ -79,6 +92,21 @@ export function buildPrompt(context: GenerationContext): PromptMessages {
       pages: f.pages.slice(0, 5).map((p) => summarizePage(p, context.application.authorizedUrl)),
     })),
     requirements: context.requirements ? clip(context.requirements, 4000) : null,
+    inventory: context.inventory
+      ? {
+          endpoints: context.inventory.endpoints.slice(0, 30).map((e) => ({
+            key: clip(e.key, 200),
+            title: clip(e.title),
+            protected: e.protected,
+            parameters: e.parameters.slice(0, 10),
+            responses: Object.fromEntries(Object.entries(e.responses).slice(0, 6).map(([code, r]) => [code, r.contract ? JSON.stringify(r.contract).slice(0, 1500) : null])),
+          })),
+          routes: context.inventory.routes.slice(0, 50),
+          requirements: context.inventory.requirements.map((r) => ({ key: clip(r.key, 40), title: clip(r.title, 300), criteria: r.criteria.map((c) => clip(c, 200)), rules: r.rules.map((c) => clip(c, 200)) })),
+          workflows: context.inventory.workflows.map((w) => ({ key: clip(w.key, 60), title: clip(w.title, 200), steps: w.steps.map((s) => `${s.keyword} ${clip(s.text, 200)}`) })),
+          roles: context.inventory.roles,
+        }
+      : null,
   };
 
   const user = [

@@ -1,16 +1,20 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { UnrecoverableError } from "bullmq";
-import type { ResultStatus, TestRunStatus } from "@/generated/prisma/enums";
+import type { Prisma } from "@/generated/prisma/client";
 import { db } from "@/lib/db";
-import { removeArtifactPrefix, writeArtifact } from "@/modules/artifacts/storage";
+import { readArtifact, removeArtifactPrefix, writeArtifact } from "@/modules/artifacts/storage";
 import { audit } from "@/modules/audit/audit";
+import { needsReproduction, reconcileAttempts, summarizeAttempt, type AttemptSummary } from "@/modules/execution/reproduction";
+import { overallStatus } from "@/modules/execution/verdict";
 import { verifyRunForExecution } from "@/modules/execution/verify";
 import { buildReport, SEVERITY_FOR_PRIORITY } from "@/modules/reports/build";
 import { resolveSecret } from "@/modules/secrets/resolver";
-import { launchSandbox, TargetBlockedError, type Sandbox } from "@/worker/browser/sandbox";
-import { executeCase, InfrastructureError, type CaseOutcome } from "./executor";
+import { launchSandbox, TargetBlockedError, type ResponseHooks, type Sandbox } from "@/worker/browser/sandbox";
+import { executeCase, InfrastructureError, StepDefinitionError, type CaseOutcome } from "./executor";
+import { pngSize } from "./visual";
 
 export type RunnerConfig = {
   workerId: string;
@@ -19,6 +23,10 @@ export type RunnerConfig = {
   staleAfterMs: number;
   heartbeatMs: number;
   allowExternalAssets: boolean;
+  /** Extra executions of a case that didn't pass (1–5), before any defect is reported. */
+  reproduceAttempts: number;
+  /** Response hooks for every page (mutation testing's baseline observes responses). */
+  responseHooks?: ResponseHooks;
   /** Test hook: called before the browser starts (used to simulate infrastructure failures). */
   beforeLaunch?: (attempt: number) => void | Promise<void>;
 };
@@ -32,6 +40,7 @@ export function runnerConfigFromEnv(workerId: string, overrides: Partial<RunnerC
     staleAfterMs: num("EXECUTION_STALE_AFTER_MS", 60_000),
     heartbeatMs: num("EXECUTION_HEARTBEAT_MS", 5_000),
     allowExternalAssets: process.env.EXECUTION_ALLOW_EXTERNAL_ASSETS === "true",
+    reproduceAttempts: num("EXECUTION_REPRODUCE_ATTEMPTS", 2),
     ...overrides,
   };
 }
@@ -57,12 +66,7 @@ export async function claimRun(runId: string, workerId: string, staleAfterMs: nu
 
 const owned = (runId: string, workerId: string) => ({ id: runId, workerId, status: "RUNNING" as const });
 
-/** Any failure fails the run; a run only passes if every case passed; otherwise it's blocked. */
-export function overallStatus(statuses: ResultStatus[]): TestRunStatus {
-  if (statuses.some((s) => s === "FAILED" || s === "ERROR")) return "FAILED";
-  if (statuses.length > 0 && statuses.every((s) => s === "PASSED")) return "PASSED";
-  return "BLOCKED";
-}
+export { overallStatus };
 
 export type ProcessOutcome = "completed" | "blocked" | "cancelled" | "duplicate";
 
@@ -116,29 +120,81 @@ export async function processRun(runId: string, config: RunnerConfig, hooks: { o
     const resolve = async (name: string) => resolveSecret(plan.secrets.get(name)!);
     let done = 0;
 
-    for (const testCase of plan.snapshot.cases) {
-      let outcome: CaseOutcome;
-      let trace: Buffer | null = null;
-      const startedAt = utcNow();
-      if (!(await shouldContinue())) {
-        outcome = { status: "SKIPPED", error: Date.now() >= deadline ? "The run reached its time limit." : "The run was cancelled.", suspectedCause: null, steps: [] };
-      } else {
-        // Each case gets a fresh, isolated browser context and its own trace.
-        const context = await sandbox.newContext();
-        const traceDir = await mkdtemp(path.join(tmpdir(), "qa-trace-"));
-        try {
-          await context.tracing.start({ screenshots: true, snapshots: true });
-          const page = await sandbox.newPage(context);
-          outcome = await executeCase(page, testCase, { authorizedUrl: plan.authorizedUrl, stepTimeoutMs: config.stepTimeoutMs, resolveSecret: resolve, shouldContinue });
+    const reproduceAttempts = Math.min(Math.max(Math.trunc(config.reproduceAttempts) || 1, 1), 5);
+    const sha256 = (data: Buffer) => createHash("sha256").update(data).digest("hex");
+    const approvedBaseline = (caseKey: string) => async (name: string) => {
+      const baseline = await db().visualBaseline.findFirst({ where: { applicationId: plan.applicationId, caseKey, name, status: "APPROVED" }, select: { id: true, storageKey: true, sha256: true } });
+      if (!baseline) return null;
+      const png = await readArtifact(baseline.storageKey);
+      // The bytes must be exactly what the reviewer approved.
+      if (sha256(png) !== baseline.sha256) throw new StepDefinitionError(`Baseline "${name}" doesn't match the image that was approved`);
+      return { id: baseline.id, png };
+    };
+    const runOnce = async (testCase: (typeof plan.snapshot.cases)[number], withTrace: boolean) => {
+      // Each execution gets a fresh, isolated browser context (no cookies or storage carried over).
+      const context = await sandbox!.newContext();
+      const traceDir = await mkdtemp(path.join(tmpdir(), "qa-trace-"));
+      const started = Date.now();
+      try {
+        if (withTrace) await context.tracing.start({ screenshots: true, snapshots: true });
+        const page = await sandbox!.newPage(context, config.responseHooks);
+        const outcome = await executeCase(page, testCase, {
+          authorizedUrl: plan.authorizedUrl,
+          stepTimeoutMs: config.stepTimeoutMs,
+          resolveSecret: resolve,
+          shouldContinue,
+          approvedBaseline: approvedBaseline(testCase.caseKey),
+        });
+        let trace: Buffer | null = null;
+        if (withTrace) {
           const tracePath = path.join(traceDir, "trace.zip");
           await context.tracing.stop({ path: tracePath }).catch(() => {});
           trace = await readFile(tracePath).catch(() => null);
-        } finally {
-          await context.close().catch(() => {});
-          await rm(traceDir, { recursive: true, force: true });
+        }
+        return { outcome, trace, durationMs: Date.now() - started };
+      } finally {
+        await context.close().catch(() => {});
+        await rm(traceDir, { recursive: true, force: true });
+      }
+    };
+
+    for (const testCase of plan.snapshot.cases) {
+      let outcome: CaseOutcome;
+      let trace: Buffer | null = null;
+      const attempts: AttemptSummary[] = [];
+      const reproductions: Reproduction[] = [];
+      const startedAt = utcNow();
+      if (!(await shouldContinue())) {
+        outcome = { status: "SKIPPED", failureClass: null, error: Date.now() >= deadline ? "The run reached its time limit." : "The run was cancelled.", suspectedCause: null, steps: [] };
+      } else {
+        const first = await runOnce(testCase, true);
+        ({ outcome, trace } = first);
+        // Visual checks without an approved baseline leave their capture as a review candidate.
+        for (const step of outcome.steps) {
+          if (step.visual && !step.visual.baselineId) await saveBaselineCandidate(plan.applicationId, testCase.caseKey, step.visual.name, step.visual.capture, runId, sha256(step.visual.capture));
+        }
+        attempts.push(summarizeAttempt(1, outcome, first.durationMs));
+        // Didn't pass: execute again from scratch before drawing any conclusion.
+        if (needsReproduction(outcome)) {
+          for (let n = 2; n <= reproduceAttempts + 1 && (await shouldContinue()); n++) {
+            const again = await runOnce(testCase, false);
+            if (again.outcome.status === "SKIPPED") break;
+            attempts.push(summarizeAttempt(n, again.outcome, again.durationMs));
+            const failing = again.outcome.steps.find((s) => s.status !== "PASSED" && s.status !== "SKIPPED");
+            reproductions.push({ attempt: n, screenshot: failing?.screenshot ?? null, position: failing?.position ?? null });
+          }
+          const verdict = reconcileAttempts(attempts);
+          outcome = {
+            ...outcome,
+            status: verdict.status,
+            failureClass: verdict.failureClass,
+            suspectedCause: verdict.flaky || verdict.status !== outcome.status ? verdict.note : [outcome.suspectedCause, verdict.note].filter(Boolean).join(" "),
+            reproduced: verdict.reproduced,
+            flaky: verdict.flaky,
+          };
         }
       }
-      await saveCaseResult(runId, testCase, outcome, trace, startedAt, plan.applicationId, ++done);
+      await saveCaseResult(runId, testCase, outcome, trace, startedAt, plan.applicationId, ++done, attempts, reproductions);
       await db().testRun.updateMany({ where: { id: runId, workerId: config.workerId }, data: { progressDone: done } });
       await hooks.onProgress?.(done, plan.snapshot.cases.length);
     }
@@ -183,6 +239,21 @@ export async function processRun(runId: string, config: RunnerConfig, hooks: { o
   }
 }
 
+type Reproduction = { attempt: number; screenshot: Buffer | null; position: number | null };
+
+/** Keeps one PENDING candidate per baseline key: the newest capture replaces older ones. */
+async function saveBaselineCandidate(applicationId: string, caseKey: string, name: string, png: Buffer, testRunId: string, sha256: string) {
+  const existing = await db().visualBaseline.findFirst({ where: { applicationId, caseKey, name, status: "PENDING", sha256 }, select: { id: true } });
+  if (existing) return;
+  const storageKey = `baselines/${applicationId}/${caseKey}/${name}/${sha256}-${Date.now().toString(36)}.png`;
+  await writeArtifact(storageKey, png, "image/png");
+  const { width, height } = pngSize(png);
+  await db().$transaction([
+    db().visualBaseline.updateMany({ where: { applicationId, caseKey, name, status: "PENDING" }, data: { status: "SUPERSEDED" } }),
+    db().visualBaseline.create({ data: { applicationId, caseKey, name, storageKey, sha256, width, height, testRunId } }),
+  ]);
+}
+
 async function saveCaseResult(
   runId: string,
   testCase: Parameters<typeof executeCase>[1],
@@ -191,6 +262,8 @@ async function saveCaseResult(
   startedAt: Date,
   applicationId: string,
   index: number,
+  attempts: AttemptSummary[],
+  reproductions: Reproduction[],
 ) {
   const liveCase = await db().testCase.findUnique({ where: { id: testCase.caseId }, select: { id: true } });
   const prefix = `runs/${runId}/case-${String(index).padStart(3, "0")}`;
@@ -204,6 +277,11 @@ async function saveCaseResult(
       featureName: testCase.featureName,
       category: testCase.type,
       status: outcome.status,
+      failureClass: outcome.failureClass,
+      attemptCount: Math.max(attempts.length, 1),
+      attempts: attempts.length ? (attempts as unknown as Prisma.InputJsonValue) : undefined,
+      flaky: outcome.flaky ?? false,
+      network: outcome.network?.length ? (outcome.network as unknown as Prisma.InputJsonValue) : undefined,
       errorMessage: outcome.error,
       suspectedCause: outcome.suspectedCause,
       durationMs: outcome.steps.reduce((sum, s) => sum + s.durationMs, 0),
@@ -223,25 +301,48 @@ async function saveCaseResult(
         expectedResult: step.expected,
         actualResult: step.actual,
         status: step.status,
+        failureClass: step.failureClass,
         durationMs: step.durationMs,
         errorMessage: step.error,
       },
       select: { id: true },
     });
+    if (step.visual) {
+      const images: Array<[string, Buffer | null]> = [["capture", step.visual.capture], ["diff", step.visual.diff]];
+      for (const [label, png] of images) {
+        if (!png) continue;
+        const key = `${prefix}/step-${String(step.position + 1).padStart(2, "0")}-visual-${label}.png`;
+        const sizeBytes = await writeArtifact(key, png, "image/png");
+        await db().artifact.create({ data: { kind: "SCREENSHOT", name: `Visual ${label} "${step.visual.name}"`, storageKey: key, mimeType: "image/png", sizeBytes, stepResultId: saved.id } });
+      }
+    }
     if (step.screenshot) {
       const key = `${prefix}/step-${String(step.position + 1).padStart(2, "0")}.png`;
       const sizeBytes = await writeArtifact(key, step.screenshot, "image/png");
       await db().artifact.create({ data: { kind: "SCREENSHOT", name: `Step ${step.position + 1} screenshot`, storageKey: key, mimeType: "image/png", sizeBytes, stepResultId: saved.id } });
     }
   }
+  const evidenceIds: string[] = [];
   if (trace) {
     const key = `${prefix}/trace.zip`;
     const sizeBytes = await writeArtifact(key, trace, "application/zip");
-    await db().artifact.create({ data: { kind: "TRACE", name: `Playwright trace — ${testCase.title}`.slice(0, 500), storageKey: key, mimeType: "application/zip", sizeBytes, testResultId: result.id } });
+    const saved = await db().artifact.create({ data: { kind: "TRACE", name: `Playwright trace — ${testCase.title}`.slice(0, 500), storageKey: key, mimeType: "application/zip", sizeBytes, testResultId: result.id }, select: { id: true } });
+    evidenceIds.push(saved.id);
+  }
+  for (const r of reproductions) {
+    if (!r.screenshot) continue;
+    const key = `${prefix}/attempt-${r.attempt}.png`;
+    const sizeBytes = await writeArtifact(key, r.screenshot, "image/png");
+    const saved = await db().artifact.create({
+      data: { kind: "SCREENSHOT", name: `Attempt ${r.attempt}${r.position !== null ? `, step ${r.position + 1}` : ""}`, storageKey: key, mimeType: "image/png", sizeBytes, testResultId: result.id },
+      select: { id: true },
+    });
+    evidenceIds.push(saved.id);
   }
 
-  // Failures open a defect (unless one is already open for this case).
-  if ((outcome.status === "FAILED" || outcome.status === "ERROR") && liveCase) {
+  // Only a *reproduced* application failure opens a defect (unless one is already open for this
+  // case); single-attempt, flaky, inconclusive, blocked and infrastructure outcomes never do.
+  if (outcome.status === "FAILED" && outcome.failureClass === "APPLICATION" && outcome.reproduced && liveCase) {
     const open = await db().defect.count({ where: { testCaseId: liveCase.id, status: { in: ["OPEN", "IN_PROGRESS"] } } });
     if (!open) {
       const failed = outcome.steps.find((s) => s.status === "FAILED");
@@ -254,6 +355,8 @@ async function saveCaseResult(
           description: failed ? `Expected: ${failed.expected ?? "—"}\nActual: ${failed.actual ?? failed.error ?? "—"}` : outcome.error,
           stepsToReproduce: outcome.steps.filter((s) => s.status !== "SKIPPED").map((s, i) => `${i + 1}. ${s.action}`).join("\n"),
           severity: SEVERITY_FOR_PRIORITY[testCase.priority],
+          verification: "REPRODUCED",
+          evidence: { runId, testResultId: result.id, signature: attempts[0]?.signature ?? null, attempts, artifactIds: evidenceIds } as unknown as Prisma.InputJsonValue,
         },
       });
     }

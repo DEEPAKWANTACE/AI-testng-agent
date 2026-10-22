@@ -35,6 +35,7 @@ export async function getTestSuite(actor: Actor, id: string) {
         include: {
           approvals: { orderBy: { requestedAt: "desc" }, include: { reviewer: { select: { name: true } }, requestedBy: { select: { name: true } } } },
           testRuns: { orderBy: { createdAt: "desc" }, take: 5, select: { id: true, status: true, createdAt: true } },
+          mutationRuns: { orderBy: { createdAt: "desc" }, take: 3 },
         },
       },
     },

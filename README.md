@@ -2,7 +2,7 @@
 
 A dashboard for managing QA work from start to finish: register applications, discover their surface area, write test plans, get them approved, run them, and review reports.
 
-> **Status:** the full workflow is implemented: discovery, AI/heuristic test generation, hash-bound review and approval, isolated Playwright execution on a Redis/BullMQ queue, reports and regression suites. Generation uses a built-in rule-based generator until an LLM provider is configured (see *Test generation*).
+> **Status:** the full workflow is implemented: an inventory built from specs, requirements, source code and discovery; AI/heuristic test generation; hash-bound review and approval; isolated Playwright execution with deterministic verdicts, automatic reproduction and flaky detection; API contract, business-rule, persistence and visual checks; coverage mapping; mutation testing; regression suites; and an accuracy benchmark. Generation uses a built-in rule-based generator until an LLM provider is configured (see *Test generation*).
 
 ## Stack
 
@@ -35,6 +35,11 @@ Project → Application → Discovery run → Features
 | **Test Runs** | Only the current approved version can be queued. The worker re-verifies everything before execution; runs move through *queued → running → passed/failed/blocked/error/cancelled*, with live progress, cancellation and bounded retries. |
 | **Reports** | Pass/fail/blocked counts, feature coverage, failed steps with expected vs actual, suggested severity, priority, reproduction steps, screenshots and Playwright traces, regression flags, filters, and HTML/JSON downloads. |
 | **Regression** | Build reusable regression suites from approved cases (they must be approved too), rerun approved versions, and compare every result with the same case's previous result: *regressed*, *fixed*, *still failing*, *unchanged* or *new*. |
+| **Inventory** | Per application: routes, API endpoints (with parameters and response contracts), roles, requirements and workflows, merged from OpenAPI specs, requirements documents, static analysis of the authorized repository and discovery. |
+| **Coverage** | Each inventory item is *verified*, *executed*, *exercised*, *planned* or *not planned*, from approved plans and the latest results, always "of the known inventory". |
+| **Visual baselines** | Visual checks compare against reviewer-approved images; runs only propose candidates. |
+| **Mutation testing** | Measures how many deliberate changes to the application's responses an approved plan detects, and lists the changes it misses. |
+| **Benchmark** | Seeded-fault corpus measuring bug recall, report precision, execution reliability and coverage. |
 | **Audit log** | Append-only, hash-chained record of generation, review, approval, execution and downloads. |
 
 ## Getting started
@@ -75,6 +80,7 @@ npm test
 | `npm run worker:jobs` | Job worker (BullMQ): test generation and test execution, with recovery of crashed runs |
 | `npm run demo:target` | Local Demo Shop on :4100 (canary on :4101) for trying discovery and test runs |
 | `npm run db:generate` | Regenerate the Prisma client |
+| `npm run benchmark` | Accuracy benchmark on the Demo Shop corpus (`-- --repeats 5 --mutation`, `-- --faults a,b`); results on `/benchmark` |
 
 `npm run build` does not need a database. Every page reads live data at request time, so pages are prerendered as static shells and the data is streamed in.
 
@@ -197,6 +203,53 @@ Heuristic hints about why something failed are always labelled *"Suspected cause
 
 Cases keep a stable `caseKey` across versions and regression suites. Every result is compared with the most recent earlier result for the same case in the application and flagged *regressed*, *fixed*, *still failing*, *unchanged* or *new*. History is preserved: versions are immutable, suites with runs can only be archived, and results keep a snapshot of the case title, priority and feature.
 
+## Accuracy
+
+The agent is built to be measurably accurate on the evidence it has, and to say so when it can't tell. It never claims complete coverage or guaranteed accuracy.
+
+**Verdicts.** Every case ends **PASSED**, **FAILED**, **BLOCKED** (couldn't run: scope, secret, manual steps), **INCONCLUSIVE** (ran, but the evidence supports no verdict) or **SKIPPED**. Each non-pass carries a failure class: *application*, *test definition*, *infrastructure*, *environment* or *unknown*. Only two things produce FAILED: a deterministic assertion that didn't hold, or a 5xx from the server while a step waited for the page. A locator that matches nothing or too much, a slow or unreachable target, or a missing value is inconclusive, never a defect. A run passes only if every case passed.
+
+**Evidence before defects.** A case that doesn't pass is re-executed (`EXECUTION_REPRODUCE_ATTEMPTS`, default 2) in fresh, isolated contexts. A defect opens only when the same failure signature (verdict, class, step, expectation) recurs on every attempt. Evidence includes a screenshot per attempt and the trace. A case that both passes and fails is reported **flaky** and INCONCLUSIVE, never as a defect, and a cross-run flake rate (isolated blips, not sustained changes) is tracked per case. Defects stay *reproduced* until a QA lead or admin *confirms* them with a note (or marks them *not confirmed*); a database constraint forbids unrecorded confirmations. Confirmation is about the defect existing, never about a suspected cause.
+
+**Deterministic checks** (all schema-validated; nothing is evaluated as code):
+
+- `EXTRACT` captures element text/values, JSON fields of responses, or URL parts (with displayed-number parsing such as "$1,234.50").
+- `ASSERT_CALC` checks a business rule as an independent calculation, e.g. `round(subtotal * 0.9, 2) == total`. It uses a hand-written parser over variables, arithmetic and `round/floor/ceil/abs/min/max`.
+- `API_GET` performs a read-only same-origin request through the sandboxed page. `ASSERT_RESPONSE` checks status, content type, a **JSON contract** (a bounded JSON Schema subset with no regex) and field values, on a fetched response or on one the page made itself.
+- `RELOAD` and unique generated values (`FILL {unique, saveAs}` and `ASSERT {expectedVariable}`) verify persisted state.
+- `ASSERT_VISUAL` compares against a reviewer-approved baseline (pixelmatch, masks, thresholds). Approval is bound to the image hash, and a baseline whose stored bytes changed is refused.
+- A data-flow check rejects cases that use a value or response before it's defined, in the editor, in generator output and again before execution.
+
+**Inventory and generation.** OpenAPI 3/Swagger 2 specs (JSON or YAML, local `$ref`s only), requirements documents (IDs, criteria, rules, user stories, roles, Gherkin workflows) and the authorized repository are analysed into an inventory with sources and confidence. The repository is cloned shallow over https only, from a vetted and pinned address, with no hooks, symlinks, submodules or credentials on the command line, and read as text, never executed. The rule-based generator turns only stated facts into checks: documented 2xx responses and schemas, documented 401/403 for signed-out callers, documented 400/422 at parameter limits, and routes marked protected. It only sends GET requests to endpoints without path parameters. Prose requirements become checks only through an LLM, and only as reviewable proposals.
+
+**Coverage** is computed from approved plan snapshots and the latest results. A case targets an item by naming its key in `requirementRefs`, by navigating to a matching route, or by requesting or checking a matching endpoint. Pages and API calls actually reached are recorded per case (paths only), which gives the *exercised* level.
+
+**Mutation testing** runs a verified, persisted baseline of an approved plan (it must pass), then re-runs the cases that reached each response, with one deliberate change applied: a number, a removed field, a 500, a missing heading, or a changed displayed number. Only responses are modified. Mutant executions open no defects and don't enter history. The score is killed ÷ evaluated, and surviving mutants are listed as gaps.
+
+**Benchmark** (`npm run benchmark`): the Demo Shop with ten seeded faults, each mapped to the cases that should catch it:
+
+| Fault type | Count |
+| --- | --- |
+| Business rule | 2 |
+| API contract | 1 |
+| Server error | 2 |
+| Visual | 1 |
+| Access control | 2 |
+| Boundary | 1 |
+| Persistence | 1 |
+
+It also includes a slow-but-correct noise variant and a deliberately flaky page. The benchmark goes through the real path: inventory, generation, approval, execution, coverage and optionally mutation. It reports:
+
+- **Bug recall:** faults detected by an expected case.
+- **Case recall.**
+- **Report precision:** a FAIL counts as correct only if the case is expected to fail for the active fault. Any FAIL on the clean app or the noise variant is a false positive.
+- **Execution reliability:** identical verdicts across repeated clean runs.
+- **Infrastructure rate.**
+- **Flaky handling.**
+- **Inventory coverage and mutation score.**
+
+Results are stored per corpus version and shown on `/benchmark`. They describe this corpus, not other applications.
+
 ## Data model
 
 Defined in [`prisma/schema.prisma`](prisma/schema.prisma) as 23 models and 28 status/type enums.
@@ -288,5 +341,9 @@ These are deliberately out of scope for this foundation:
 - User administration UI (creating users, resetting passwords) and SSO
 - A shared rate-limit store for multi-instance deployments
 - Clients for Vault, AWS, GCP and Azure secret managers (references can be stored now; only `env://` resolves)
-- Object storage for artifacts (files are stored on local disk), and container-level sandboxing for the worker (run it in its own container or VM in production)
+- Container-level sandboxing for the workers (run them in their own container or VM in production)
+- Role-specific credentials for permission tests: access-control cases cover signed-out vs signed-in only
+- Proposing a new visual baseline from a failed comparison (after an intentional redesign); today a new candidate is captured only when no baseline is approved
+- Mutation operators that change requests or server-side state (by design, only responses are mutated)
+- Cleanup of a deleted project's files in object storage
 - Discovery of SPA routes reachable only by clicking non-link elements (the crawler follows links)

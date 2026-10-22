@@ -9,7 +9,7 @@ import { reportHtml, reportJson } from "@/modules/reports/export";
 
 const querySchema = z.object({
   format: z.enum(["html", "json"]).default("html"),
-  status: z.enum(["PASSED", "FAILED", "SKIPPED", "BLOCKED", "ERROR"]).optional(),
+  status: z.enum(["PASSED", "FAILED", "SKIPPED", "BLOCKED", "INCONCLUSIVE"]).optional(),
   feature: z.string().max(200).optional(),
   priority: z.enum(["LOW", "MEDIUM", "HIGH", "CRITICAL"]).optional(),
   regressions: z.enum(["1"]).optional(),

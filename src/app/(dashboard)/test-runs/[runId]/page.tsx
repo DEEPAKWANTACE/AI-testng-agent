@@ -14,7 +14,10 @@ import { Table, TBody, TD, THead } from "@/components/ui/table";
 import { formatDateTime, humanize } from "@/lib/utils";
 import { requireActor } from "@/modules/auth/session";
 import { SUSPECTED_CAUSE_LABEL, type FeatureCoverage } from "@/modules/reports/build";
-import { filterResults } from "@/modules/reports/export";
+import { DefectVerificationForm } from "@/modules/defects/components/defect-verification-form";
+import { verifyDefectAction } from "@/modules/defects/actions";
+import { FAILURE_CLASS_LABELS } from "@/modules/execution/verdict";
+import { filterResults, REPORT_LIMITATIONS } from "@/modules/reports/export";
 import { cancelTestRun, rerunVersion } from "@/modules/test-runs/actions";
 import { getRunReport } from "@/modules/test-runs/queries";
 
@@ -33,7 +36,7 @@ export default function RunReportPage({ params, searchParams }: PageProps<"/test
   );
 }
 
-const STATUSES = ["PASSED", "FAILED", "BLOCKED", "SKIPPED", "ERROR"] as const;
+const STATUSES = ["PASSED", "FAILED", "BLOCKED", "INCONCLUSIVE", "SKIPPED"] as const;
 const PRIORITIES = ["CRITICAL", "HIGH", "MEDIUM", "LOW"] as const;
 const one = (v: string | string[] | undefined) => (typeof v === "string" ? v : undefined);
 
@@ -50,7 +53,7 @@ async function RunReport({ params, searchParams }: { params: PageProps<"/test-ru
     regressionsOnly: one(query.regressions) === "1",
   };
   const results = filterResults(run, filters);
-  const coverage = (run.report?.coverage ?? { features: [], uncovered: [] }) as { features: FeatureCoverage[]; uncovered: string[] };
+  const coverage = (run.report?.coverage ?? { features: [], uncovered: [] }) as { features: FeatureCoverage[]; uncovered: string[]; inventory?: { known: number; byLevel: Record<string, number>; notVerified: string[]; disclaimer: string } | null };
   const active = run.status === "QUEUED" || run.status === "RUNNING";
   const approval = run.planVersion.approvals[0];
   const qs = (extra: Record<string, string>) => {
@@ -62,8 +65,9 @@ async function RunReport({ params, searchParams }: { params: PageProps<"/test-ru
 
   const tiles = [
     { label: "Passed", value: run.report?.passed ?? 0, tone: "text-emerald-600" },
-    { label: "Failed", value: (run.report?.failed ?? 0) + (run.report?.errored ?? 0), tone: "text-red-600" },
+    { label: "Failed", value: run.report?.failed ?? 0, tone: "text-red-600" },
     { label: "Blocked", value: run.report?.blocked ?? 0, tone: "text-amber-600" },
+    { label: "Inconclusive", value: (run.report?.inconclusive ?? 0) + (run.report?.errored ?? 0), tone: "text-amber-600" },
     { label: "Skipped", value: run.report?.skipped ?? 0, tone: "" },
     { label: "Regressions", value: run.report?.regressions ?? 0, tone: run.report?.regressions ? "text-red-600" : "" },
     { label: "Fixed", value: run.report?.fixed ?? 0, tone: "" },
@@ -121,7 +125,7 @@ async function RunReport({ params, searchParams }: { params: PageProps<"/test-ru
         </div>
       ) : null}
 
-      <div className="mb-6 grid grid-cols-3 gap-3 lg:grid-cols-6">
+      <div className="mb-6 grid grid-cols-3 gap-3 lg:grid-cols-7">
         {tiles.map((t) => (
           <div key={t.label} className="rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-800 dark:bg-zinc-900">
             <p className="text-xs font-medium tracking-wide text-zinc-500 uppercase">{t.label}</p>
@@ -129,6 +133,8 @@ async function RunReport({ params, searchParams }: { params: PageProps<"/test-ru
           </div>
         ))}
       </div>
+
+      <p className="mb-6 -mt-3 text-xs text-zinc-500">{REPORT_LIMITATIONS}</p>
 
       <div className="grid gap-6 lg:grid-cols-3">
         <div className="space-y-6 lg:col-span-2">
@@ -185,17 +191,21 @@ async function RunReport({ params, searchParams }: { params: PageProps<"/test-ru
                         <span className="font-medium text-zinc-900 dark:text-zinc-100">{r.caseTitle}</span>
                         {r.comparison === "REGRESSED" ? <StatusBadge status="Regression" tone="danger" /> : null}
                         {r.comparison === "FIXED" ? <StatusBadge status="Fixed" tone="success" /> : null}
+                        {r.flaky ? <StatusBadge status="Flaky" tone="warning" /> : null}
+                        {r.failureClass ? <span className="text-xs text-zinc-500">Failure class: {FAILURE_CLASS_LABELS[r.failureClass]}</span> : null}
                       </div>
                       <p className="mt-0.5 text-xs text-zinc-500">
                         {r.featureName ?? "No feature"} · {humanize(r.category ?? "FUNCTIONAL")} · priority {humanize(r.casePriority)}
                         {r.suggestedSeverity ? ` · suggested severity ${humanize(r.suggestedSeverity)}` : ""}
                         {r.previousStatus ? ` · previously ${humanize(r.previousStatus)}` : ""}
                         {r.durationMs ? ` · ${(r.durationMs / 1000).toFixed(1)}s` : ""}
+                        {r.attemptCount > 1 ? ` · ${r.attemptCount} attempts` : ""}
+                        {r.flakeRate ? ` · flake rate ${Math.round(r.flakeRate * 100)}% (recent runs, heuristic)` : ""}
                       </p>
                       {r.errorMessage ? <p className="mt-1 text-sm text-red-700 dark:text-red-400">{r.errorMessage}</p> : null}
                       {failed ? (
                         <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 rounded border border-zinc-200 p-2 text-xs dark:border-zinc-800">
-                          <dt className="text-zinc-500">Failed step</dt>
+                          <dt className="text-zinc-500">{failed.status === "FAILED" ? "Failed step" : `${humanize(failed.status)} step`}</dt>
                           <dd>{failed.position + 1}. {failed.action}</dd>
                           <dt className="text-zinc-500">Expected</dt>
                           <dd>{failed.expectedResult ?? "—"}</dd>
@@ -224,6 +234,16 @@ async function RunReport({ params, searchParams }: { params: PageProps<"/test-ru
                             </li>
                           ))}
                         </ol>
+                        {r.attemptCount > 1 ? (
+                          <ul className="mt-2 space-y-0.5 text-zinc-600 dark:text-zinc-300" aria-label="Attempts">
+                            {((r.attempts ?? []) as Array<{ attempt: number; status: string; failedStep: number | null; durationMs: number }>).map((a) => (
+                              <li key={a.attempt}>
+                                Attempt {a.attempt}: {humanize(a.status)}
+                                {a.failedStep !== null ? ` at step ${a.failedStep + 1}` : ""} · {(a.durationMs / 1000).toFixed(1)}s
+                              </li>
+                            ))}
+                          </ul>
+                        ) : null}
                         {r.artifacts.length ? (
                           <p className="mt-2">
                             {r.artifacts.map((a) => (
@@ -233,7 +253,15 @@ async function RunReport({ params, searchParams }: { params: PageProps<"/test-ru
                             ))}
                           </p>
                         ) : null}
-                        {r.defects.length ? <p className="mt-1 text-zinc-500">Defect opened ({humanize(r.defects[0].severity)}).</p> : null}
+                        {r.defects.map((d) => (
+                          <div key={d.id} className="mt-2 rounded border border-zinc-200 p-2 dark:border-zinc-800">
+                            <p className="text-zinc-600 dark:text-zinc-300">
+                              Defect ({humanize(d.severity)}) · <StatusBadge status={d.verification === "REPRODUCED" ? "Reproduced, awaiting review" : humanize(d.verification)} tone={d.verification === "CONFIRMED" ? "danger" : d.verification === "REPRODUCED" ? "warning" : "neutral"} />
+                              {d.verifiedAt ? ` by ${d.verifiedBy?.name ?? "a former user"} on ${formatDateTime(d.verifiedAt)}: ${d.verificationNote ?? ""}` : null}
+                            </p>
+                            {d.verification === "REPRODUCED" && run.permissions.verifyDefects ? <DefectVerificationForm action={verifyDefectAction.bind(null, d.id)} /> : null}
+                          </div>
+                        ))}
                       </details>
                     </li>
                   );
@@ -271,6 +299,15 @@ async function RunReport({ params, searchParams }: { params: PageProps<"/test-ru
             )}
             {coverage.uncovered.length ? (
               <CardBody className="border-t border-zinc-200 text-xs text-zinc-500 dark:border-zinc-800">Not covered: {coverage.uncovered.join(", ")}</CardBody>
+            ) : null}
+            {coverage.inventory ? (
+              <CardBody className="space-y-1 border-t border-zinc-200 text-xs text-zinc-600 dark:border-zinc-800 dark:text-zinc-300">
+                <p className="font-medium">
+                  Known inventory: {coverage.inventory.byLevel.VERIFIED} of {coverage.inventory.known} items verified by this run
+                </p>
+                {coverage.inventory.notVerified.length ? <p className="text-zinc-500">Not verified: {coverage.inventory.notVerified.slice(0, 15).join(", ")}{coverage.inventory.notVerified.length > 15 ? "…" : ""}</p> : null}
+                <p className="text-zinc-500">{coverage.inventory.disclaimer}</p>
+              </CardBody>
             ) : null}
           </Card>
           <Card>

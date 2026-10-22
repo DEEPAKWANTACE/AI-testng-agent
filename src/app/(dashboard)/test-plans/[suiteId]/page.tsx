@@ -15,6 +15,7 @@ import { Priority, TestCaseType } from "@/generated/prisma/enums";
 import { enumOptions, formatDateTime, humanize, pluralize } from "@/lib/utils";
 import { requireActor } from "@/modules/auth/session";
 import { describeAction } from "@/modules/execution/steps";
+import { MutationPanel } from "@/modules/mutation/components/mutation-panel";
 import { rerunVersion } from "@/modules/test-runs/actions";
 import { addTestCase, archiveTestSuite, deleteTestSuite, reviewTestCases, submitForApproval, updateTestSuite } from "@/modules/test-suites/actions";
 import { getTestSuite } from "@/modules/test-suites/queries";
@@ -222,6 +223,9 @@ async function TestSuiteDetail({ params }: { params: PageProps<"/test-plans/[sui
                             </Link>
                           ))}
                         </p>
+                      ) : null}
+                      {version.status === "APPROVED" && version.snapshotFormat === 2 ? (
+                        <MutationPanel planVersionId={version.id} runs={version.mutationRuns} canRun={suite.permissions.run} />
                       ) : null}
                     </li>
                   );

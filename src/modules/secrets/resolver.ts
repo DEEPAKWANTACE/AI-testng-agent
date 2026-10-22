@@ -1,4 +1,6 @@
 import "server-only";
+import { db } from "@/lib/db";
+import { decryptSecret } from "./vault";
 import { providerForReference, SECRET_REFERENCE_FORMATS } from "./schemas";
 
 function envVariableName(reference: string): string | null {
@@ -19,6 +21,12 @@ export async function resolveSecret(reference: string): Promise<string> {
     if (value === undefined || value === "") throw new Error(`Secret ${reference} is not set in the server environment`);
     return value;
   }
+  if (provider === "LOCAL") {
+    const id = reference.slice("local://".length);
+    const row = await db().applicationSecret.findUnique({ where: { id }, select: { encryptedValue: true } });
+    if (!row?.encryptedValue) throw new Error(`Secret ${reference} no longer exists`);
+    return decryptSecret(row.encryptedValue, id);
+  }
   throw new Error(`Secret provider ${provider ?? "unknown"} is not configured on this server`);
 }
 
@@ -26,7 +34,9 @@ export type SecretAvailability = "available" | "missing" | "external";
 
 /** For the UI: whether a reference can be resolved, without revealing the value. */
 export function secretAvailability(reference: string): SecretAvailability {
-  if (providerForReference(reference) !== "ENV") return "external";
+  const provider = providerForReference(reference);
+  if (provider === "LOCAL") return "available";
+  if (provider !== "ENV") return "external";
   const name = envVariableName(reference);
   return name && process.env[name] ? "available" : "missing";
 }

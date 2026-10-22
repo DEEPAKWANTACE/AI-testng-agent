@@ -54,6 +54,8 @@ enum SecretProvider {
   AWS_SECRETS_MANAGER
   GCP_SECRET_MANAGER
   AZURE_KEY_VAULT
+  /// Entered in the dashboard; stored AES-256-GCM encrypted (see modules/secrets/vault.ts).
+  LOCAL
 }
 
 enum AppEnvironment {
@@ -132,6 +134,22 @@ enum StepKind {
   SELECT
   WAIT
   ASSERT
+  RELOAD
+  EXTRACT
+  ASSERT_CALC
+  API_GET
+  ASSERT_RESPONSE
+  ASSERT_VISUAL
+}
+
+/// Lifecycle of a visual baseline image. Only APPROVED baselines are compared against.
+enum BaselineStatus {
+  /// Captured by a run; waiting for a reviewer.
+  PENDING
+  APPROVED
+  REJECTED
+  /// Replaced by a newer approved baseline (or a newer candidate).
+  SUPERSEDED
 }
 
 enum SuiteKind {
@@ -183,6 +201,9 @@ enum TestRunStatus {
   FAILED
   /// Refused before execution: approval, hash, target or environment checks failed.
   BLOCKED
+  /// Executed, nothing failed, but at least one case couldn't produce a trustworthy verdict.
+  INCONCLUSIVE
+  /// Infrastructure failure (worker, browser, time limit) after the retry budget.
   ERROR
   CANCELLED
 }
@@ -191,15 +212,34 @@ enum TestRunTrigger {
   MANUAL
   SCHEDULED
   CI
+  /// Baseline run of a mutation analysis.
+  MUTATION
 }
 
 /// Outcome of a test case or an individual step within a run.
+/// PASSED/FAILED are verdicts; BLOCKED = couldn't start (precondition, scope, secret);
+/// INCONCLUSIVE = ran but the evidence doesn't support a verdict either way.
 enum ResultStatus {
   PASSED
   FAILED
   SKIPPED
   BLOCKED
+  INCONCLUSIVE
+  /// Legacy: older runs recorded infrastructure problems per case as ERROR.
   ERROR
+}
+
+/// Why a step didn't pass. Only APPLICATION failures can become defects.
+enum FailureClass {
+  /// The application's observable behaviour contradicts a deterministic assertion.
+  APPLICATION
+  /// The test itself is suspect (locator not found or ambiguous, invalid scope).
+  TEST_DEFINITION
+  /// Browser, network, proxy or worker problems.
+  INFRASTRUCTURE
+  /// Target unreachable, redirected out of scope, missing secret or precondition.
+  ENVIRONMENT
+  UNKNOWN
 }
 
 enum DefectSeverity {
@@ -207,6 +247,16 @@ enum DefectSeverity {
   MAJOR
   MINOR
   TRIVIAL
+}
+
+/// How far a defect's existence has been verified. Automated runs can only reach REPRODUCED
+/// (the same failure on every attempt); CONFIRMED requires a person who reviewed the evidence.
+/// This is about whether the defect exists, never about its root cause.
+enum DefectVerification {
+  REPRODUCED
+  CONFIRMED
+  /// A person reviewed the evidence and could not confirm it (or it no longer reproduces).
+  NOT_CONFIRMED
 }
 
 enum DefectStatus {
@@ -257,6 +307,11 @@ model User {
   triggeredRuns       TestRun[]           @relation("TestRunTriggeredBy")
   reportedDefects     Defect[]            @relation("DefectReporter")
   assignedDefects     Defect[]            @relation("DefectAssignee")
+  verifiedDefects     Defect[]            @relation("DefectVerifiedBy")
+  reviewedBaselines   VisualBaseline[]    @relation("BaselineReviewer")
+  inventoryDocs       InventoryDocument[] @relation("InventoryDocumentCreatedBy")
+  sourceAnalyses      SourceAnalysis[]    @relation("SourceAnalysisTriggeredBy")
+  mutationRuns        MutationRun[]       @relation("MutationRunTriggeredBy")
 
   @@index([status, role])
 }
@@ -322,13 +377,17 @@ model Application {
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
 
-  secrets        ApplicationSecret[]
-  discoveryAuth  DiscoveryAuthConfig?
-  generationJobs GenerationJob[]
-  features       Feature[]
-  discoveryRuns  DiscoveryRun[]
-  testSuites     TestSuite[]
-  defects        Defect[]
+  secrets         ApplicationSecret[]
+  discoveryAuth   DiscoveryAuthConfig?
+  generationJobs  GenerationJob[]
+  features        Feature[]
+  discoveryRuns   DiscoveryRun[]
+  testSuites      TestSuite[]
+  defects         Defect[]
+  visualBaselines VisualBaseline[]
+  inventoryItems  InventoryItem[]
+  inventoryDocs   InventoryDocument[]
+  sourceAnalyses  SourceAnalysis[]
 
   @@unique([projectId, name])
   @@index([createdAt])
@@ -337,19 +396,21 @@ model Application {
 /// A named pointer to a secret held in an external secret manager (e.g. test-account
 /// credentials). Only the reference is stored; values are resolved at use time.
 model ApplicationSecret {
-  id            String         @id @default(cuid())
-  applicationId String
-  application   Application    @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  id             String         @id @default(cuid())
+  applicationId  String
+  application    Application    @relation(fields: [applicationId], references: [id], onDelete: Cascade)
   /// Identifier used by tests, e.g. TEST_USER_PASSWORD.
-  name          String
-  provider      SecretProvider
+  name           String
+  provider       SecretProvider
   /// e.g. env://QA_STOREFRONT_PASSWORD or vault://kv/qa/storefront#password
-  reference     String
-  description   String?
-  createdById   String?
-  createdBy     User?          @relation("ApplicationSecretCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
-  createdAt     DateTime       @default(now())
-  updatedAt     DateTime       @updatedAt
+  reference      String
+  /// AES-256-GCM ciphertext (iv.tag.data, base64url) for LOCAL secrets; null for external references.
+  encryptedValue String?
+  description    String?
+  createdById    String?
+  createdBy      User?          @relation("ApplicationSecretCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
 
   usedAsDiscoveryUsername DiscoveryAuthConfig[] @relation("DiscoveryAuthUsername")
   usedAsDiscoveryPassword DiscoveryAuthConfig[] @relation("DiscoveryAuthPassword")
@@ -418,6 +479,8 @@ model DiscoveryRun {
   startUrl      String
   maxDepth      Int                @default(2)
   maxPages      Int                @default(25)
+  /// "Auto-test" runs queue test-case generation for every discovered feature when they complete.
+  autoGenerate  Boolean            @default(false)
   pagesVisited  Int                @default(0)
   summary       String?
   errorMessage  String?
@@ -578,8 +641,9 @@ model PlanVersion {
   createdAt      DateTime          @default(now())
   approvedAt     DateTime?
 
-  approvals Approval[]
-  testRuns  TestRun[]
+  approvals    Approval[]
+  testRuns     TestRun[]
+  mutationRuns MutationRun[]
 
   @@unique([suiteId, version])
   @@index([status, createdAt])
@@ -667,6 +731,16 @@ model TestResult {
   featureName    String?
   category       TestCaseType?
   status         ResultStatus
+  failureClass   FailureClass?
+  /// Executions of this case in the run (1 + reproduction attempts) and their outcomes.
+  attemptCount   Int               @default(1)
+  attempts       Json?
+  /// The case both passed and failed within this run.
+  flaky          Boolean           @default(false)
+  /// Share of verdict changes across this case's recent runs (0–1); null without enough history.
+  flakeRate      Float?
+  /// Same-origin pages and API calls the case actually reached: [{ type, method, path, status }].
+  network        Json?
   comparison     ResultComparison?
   previousStatus ResultStatus?
   /// Heuristic hint only — always presented as unconfirmed.
@@ -689,11 +763,11 @@ model TestResult {
 }
 
 model StepResult {
-  id             String       @id @default(cuid())
+  id             String        @id @default(cuid())
   testResultId   String
-  testResult     TestResult   @relation(fields: [testResultId], references: [id], onDelete: Cascade)
+  testResult     TestResult    @relation(fields: [testResultId], references: [id], onDelete: Cascade)
   testStepId     String?
-  testStep       TestStep?    @relation(fields: [testStepId], references: [id], onDelete: SetNull)
+  testStep       TestStep?     @relation(fields: [testStepId], references: [id], onDelete: SetNull)
   position       Int
   /// Snapshot of the step as executed.
   action         String
@@ -701,9 +775,10 @@ model StepResult {
   expectedResult String?
   actualResult   String?
   status         ResultStatus
+  failureClass   FailureClass?
   durationMs     Int?
   errorMessage   String?
-  createdAt      DateTime     @default(now())
+  createdAt      DateTime      @default(now())
 
   artifacts Artifact[]
 
@@ -714,28 +789,35 @@ model StepResult {
 // ─── Outcomes ───────────────────────────────────────────────────────────────
 
 model Defect {
-  id               String         @id @default(cuid())
+  id               String             @id @default(cuid())
   applicationId    String
-  application      Application    @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  application      Application        @relation(fields: [applicationId], references: [id], onDelete: Cascade)
   /// The failing result this defect was raised from, if any.
   testResultId     String?
-  testResult       TestResult?    @relation(fields: [testResultId], references: [id], onDelete: SetNull)
+  testResult       TestResult?        @relation(fields: [testResultId], references: [id], onDelete: SetNull)
   testCaseId       String?
-  testCase         TestCase?      @relation(fields: [testCaseId], references: [id], onDelete: SetNull)
+  testCase         TestCase?          @relation(fields: [testCaseId], references: [id], onDelete: SetNull)
   title            String
   description      String?
   stepsToReproduce String?
-  severity         DefectSeverity @default(MAJOR)
-  status           DefectStatus   @default(OPEN)
+  severity         DefectSeverity     @default(MAJOR)
+  status           DefectStatus       @default(OPEN)
+  verification     DefectVerification @default(REPRODUCED)
+  /// Reproduction evidence: failure signature, attempt outcomes, run and artifact ids.
+  evidence         Json?
+  verifiedById     String?
+  verifiedBy       User?              @relation("DefectVerifiedBy", fields: [verifiedById], references: [id], onDelete: SetNull)
+  verifiedAt       DateTime?
+  verificationNote String?
   /// Link to an external tracker (Jira, Linear, GitHub…).
   externalUrl      String?
   reportedById     String?
-  reportedBy       User?          @relation("DefectReporter", fields: [reportedById], references: [id], onDelete: SetNull)
+  reportedBy       User?              @relation("DefectReporter", fields: [reportedById], references: [id], onDelete: SetNull)
   assigneeId       String?
-  assignee         User?          @relation("DefectAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  assignee         User?              @relation("DefectAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
   resolvedAt       DateTime?
-  createdAt        DateTime       @default(now())
-  updatedAt        DateTime       @updatedAt
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
 
   artifacts Artifact[]
 
@@ -779,21 +861,26 @@ model Artifact {
 }
 
 model Report {
-  id          String   @id @default(cuid())
-  testRunId   String   @unique
-  testRun     TestRun  @relation(fields: [testRunId], references: [id], onDelete: Cascade)
-  title       String
-  summary     String?
-  passed      Int      @default(0)
-  failed      Int      @default(0)
-  skipped     Int      @default(0)
-  blocked     Int      @default(0)
-  errored     Int      @default(0)
-  regressions Int      @default(0)
-  fixed       Int      @default(0)
+  id             String   @id @default(cuid())
+  testRunId      String   @unique
+  testRun        TestRun  @relation(fields: [testRunId], references: [id], onDelete: Cascade)
+  title          String
+  summary        String?
+  passed         Int      @default(0)
+  failed         Int      @default(0)
+  skipped        Int      @default(0)
+  blocked        Int      @default(0)
+  inconclusive   Int      @default(0)
+  /// Cases that both passed and failed within the run.
+  flaky          Int      @default(0)
+  errored        Int      @default(0)
+  /// Non-passing cases by failure class (APPLICATION, TEST_DEFINITION, INFRASTRUCTURE…).
+  failureClasses Json?
+  regressions    Int      @default(0)
+  fixed          Int      @default(0)
   /// Per-feature coverage and pass rates (see src/modules/reports/build.ts).
-  coverage    Json?
-  createdAt   DateTime @default(now())
+  coverage       Json?
+  createdAt      DateTime @default(now())
 }
 
 /// An AI (or heuristic) test-case generation request. Output is saved as PROPOSED cases in a
@@ -844,4 +931,198 @@ model AuditLog {
 
   @@index([projectId, createdAt])
   @@index([entityType, entityId])
+}
+
+/// Expected appearance of one ASSERT_VISUAL step (application + case + name). A run never
+/// approves its own capture: candidates stay PENDING until a reviewer approves the exact
+/// image (by hash). At most one APPROVED baseline per key (partial unique index).
+model VisualBaseline {
+  id            String         @id @default(cuid())
+  applicationId String
+  application   Application    @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  caseKey       String
+  name          String
+  status        BaselineStatus @default(PENDING)
+  storageKey    String         @unique
+  sha256        String
+  width         Int
+  height        Int
+  /// Run that captured it.
+  testRunId     String?
+  reviewerId    String?
+  reviewer      User?          @relation("BaselineReviewer", fields: [reviewerId], references: [id], onDelete: SetNull)
+  reviewedAt    DateTime?
+  reviewNote    String?
+  createdAt     DateTime       @default(now())
+
+  @@index([applicationId, caseKey, name, status])
+  @@index([status, createdAt])
+  @@index([reviewerId])
+}
+
+// ─── Inventory (what the application is known to contain) ──────────────────
+
+enum InventoryKind {
+  ROUTE
+  API_ENDPOINT
+  ROLE
+  REQUIREMENT
+  WORKFLOW
+}
+
+/// Where an inventory item was learned from. Each source's contribution is replaced as a
+/// whole when that source is analysed again.
+enum InventorySource {
+  OPENAPI
+  REQUIREMENTS
+  SOURCE_CODE
+  DISCOVERY
+}
+
+enum Confidence {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum AnalysisStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+/// An uploaded OpenAPI spec or requirements document (kept verbatim for traceability).
+model InventoryDocument {
+  id            String          @id @default(cuid())
+  applicationId String
+  application   Application     @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  source        InventorySource
+  name          String
+  content       String
+  sha256        String
+  itemCount     Int             @default(0)
+  createdById   String?
+  createdBy     User?           @relation("InventoryDocumentCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt     DateTime        @default(now())
+
+  @@index([applicationId, source, createdAt])
+  @@index([createdById])
+}
+
+/// Static analysis of the application's authorized repository. Code is read, never run.
+model SourceAnalysis {
+  id            String         @id @default(cuid())
+  applicationId String
+  application   Application    @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  status        AnalysisStatus @default(QUEUED)
+  repoUrl       String
+  repoBranch    String?
+  /// Optional application secret (by name) holding a read-only access token.
+  tokenSecret   String?
+  commitSha     String?
+  stats         Json?
+  errorMessage  String?
+  workerId      String?
+  triggeredById String?
+  triggeredBy   User?          @relation("SourceAnalysisTriggeredBy", fields: [triggeredById], references: [id], onDelete: SetNull)
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  createdAt     DateTime       @default(now())
+
+  @@index([status, createdAt])
+  @@index([applicationId, createdAt])
+  @@index([triggeredById])
+}
+
+/// One known route, API endpoint, role, requirement or workflow of an application.
+model InventoryItem {
+  id            String        @id @default(cuid())
+  applicationId String
+  application   Application   @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  kind          InventoryKind
+  /// Normalized identity: "/cart", "GET /api/cart", "admin", "REQ-12", "checkout-with-coupon".
+  key           String
+  title         String
+  /// Kind-specific facts (parameters, contracts, acceptance criteria, scenario steps…).
+  details       Json?
+  /// [{ source, ref, documentId?, analysisId? }]: every place this item was found.
+  sources       Json
+  confidence    Confidence    @default(MEDIUM)
+  /// Requires authentication, as far as the sources tell.
+  protected     Boolean?
+  /// Roles mentioned as allowed for this item.
+  roles         String[]      @default([])
+  /// False once no source mentions it any more (kept for coverage history).
+  active        Boolean       @default(true)
+  firstSeenAt   DateTime      @default(now())
+  lastSeenAt    DateTime      @default(now())
+
+  @@unique([applicationId, kind, key])
+  @@index([applicationId, active, kind])
+}
+
+// ─── Mutation testing ───────────────────────────────────────────────────────
+
+enum MutationRunStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  /// The baseline didn't pass, or the plan can't be executed: no score is computed.
+  BLOCKED
+  FAILED
+}
+
+/// Measures how many deliberately mutated responses an approved plan detects.
+model MutationRun {
+  id            String            @id @default(cuid())
+  planVersionId String
+  planVersion   PlanVersion       @relation(fields: [planVersionId], references: [id], onDelete: Cascade)
+  status        MutationRunStatus @default(QUEUED)
+  mutantLimit   Int               @default(20)
+  /// The ordinary (persisted, verified) run used as the unmutated baseline.
+  baselineRunId String?
+  killed        Int               @default(0)
+  survived      Int               @default(0)
+  /// Neither killed nor survived: only inconclusive outcomes, or the change never applied.
+  unclear       Int               @default(0)
+  /// killed / (killed + survived + unclear); null when no mutant could be evaluated.
+  score         Float?
+  /// [{ id, operator, target, location, description, outcome, killedBy, note }]
+  mutants       Json?
+  blockedReason String?
+  errorMessage  String?
+  workerId      String?
+  triggeredById String?
+  triggeredBy   User?             @relation("MutationRunTriggeredBy", fields: [triggeredById], references: [id], onDelete: SetNull)
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  createdAt     DateTime          @default(now())
+
+  @@index([status, createdAt])
+  @@index([planVersionId, createdAt])
+  @@index([triggeredById])
+}
+
+// ─── Benchmark ──────────────────────────────────────────────────────────────
+
+/// One execution of the accuracy benchmark (bundled corpus with seeded faults).
+model BenchmarkRun {
+  id            String         @id @default(cuid())
+  status        AnalysisStatus @default(RUNNING)
+  corpusVersion String
+  /// Commit of the agent being measured, when known.
+  gitCommit     String?
+  /// Options: faults included, repeats, mutation analysis on/off.
+  config        Json
+  /// Headline numbers: recall, precision, reliability, coverage, mutation score.
+  metrics       Json?
+  /// Per-fault and per-run evidence behind the metrics.
+  details       Json?
+  errorMessage  String?
+  durationMs    Int?
+  startedAt     DateTime       @default(now())
+  finishedAt    DateTime?
+
+  @@index([startedAt])
 }

@@ -6,7 +6,7 @@ import type { ProjectRole, UserRole } from "@/generated/prisma/enums";
  * - Global ADMIN: every permission on every project.
  * - Global VIEWER: read-only, whatever their project role.
  * - Everyone else: permissions come from their role in the project.
- * - Reviewing plans also needs a global reviewer role (ADMIN or QA_LEAD).
+ * - Reviewing plans and verifying defects also need a global reviewer role (ADMIN or QA_LEAD).
  */
 export type Permission =
   | "project.view"
@@ -21,6 +21,7 @@ export type Permission =
   | "suite.edit"
   | "suite.delete"
   | "plan.review"
+  | "defect.verify"
   | "run.manage";
 
 const VIEWER: Permission[] = ["project.view"];
@@ -32,6 +33,7 @@ const EDITOR: Permission[] = [
   "discovery.run",
   "suite.edit",
   "plan.review",
+  "defect.verify",
   "run.manage",
 ];
 const OWNER: Permission[] = [
@@ -55,7 +57,7 @@ export function can(userRole: UserRole, projectRole: ProjectRole | null, permiss
   if (userRole === "ADMIN") return true;
   if (!projectRole) return false;
   if (userRole === "VIEWER") return permission === "project.view";
-  if (permission === "plan.review" && !REVIEWER_ROLES.includes(userRole)) return false;
+  if ((permission === "plan.review" || permission === "defect.verify") && !REVIEWER_ROLES.includes(userRole)) return false;
   return PROJECT_ROLE_PERMISSIONS[projectRole].has(permission);
 }
 

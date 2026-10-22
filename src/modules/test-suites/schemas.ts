@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { Priority, TestCaseType } from "@/generated/prisma/enums";
-import { executableStepSchema } from "@/modules/execution/steps";
+import { executableStepsSchema } from "@/modules/execution/steps";
 import { optionalText, requiredText } from "@/lib/validation";
 
 export const testSuiteInputSchema = z.object({
@@ -41,10 +41,10 @@ export const stepsInputSchema = z
         ctx.addIssue({ code: "custom", message: "Steps JSON is not valid JSON" });
         return z.NEVER;
       }
-      const parsed = z.array(executableStepSchema).min(1).max(50).safeParse(raw);
+      const parsed = executableStepsSchema.safeParse(raw);
       if (!parsed.success) {
         const issue = parsed.error.issues[0];
-        ctx.addIssue({ code: "custom", message: `Step ${typeof issue.path[0] === "number" ? issue.path[0] + 1 : ""}: ${issue.message} (${issue.path.slice(1).join(".")})` });
+        ctx.addIssue({ code: "custom", message: typeof issue.path[0] === "number" ? `Step ${issue.path[0] + 1}: ${issue.message} (${issue.path.slice(1).join(".")})` : issue.message });
         return z.NEVER;
       }
       return parsed.data.map((step) => ({ action: step.description, expectedResult: step.expected ?? null, kind: step.kind, params: step.params }));

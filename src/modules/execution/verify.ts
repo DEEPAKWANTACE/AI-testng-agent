@@ -3,7 +3,7 @@ import { db } from "@/lib/db";
 import { can } from "@/modules/access/policy";
 import { defaultPort, resolveTarget, staticUrlBlockReason, BLOCK_REASON_LABELS } from "@/modules/discovery/network-policy";
 import { parsePlanSnapshot, type PlanSnapshot } from "@/modules/test-suites/snapshot";
-import { referencedSecrets, resolveNavigation, stepParamsSchemas, type StepKindName } from "./steps";
+import { referencedSecrets, resolveNavigation, stepParamsSchemas, stepSequenceIssues, type StepKindName } from "./steps";
 
 /**
  * Pre-execution verification, run by the worker immediately before a browser is launched.
@@ -116,9 +116,13 @@ export async function verifyRunForExecution(runId: string, options: { resolveDns
       if (step.kind === null) continue; // descriptive steps make that case BLOCKED at run time
       const params = stepParamsSchemas[step.kind as StepKindName].safeParse(step.params);
       if (!params.success) return fail(`"${testCase.title}" step ${step.position + 1} is invalid.`);
-      if (step.kind === "NAVIGATE" && !resolveNavigation((params.data as { url: string }).url, app.authorizedUrl)) {
-        return fail(`"${testCase.title}" step ${step.position + 1} navigates outside the authorized URL.`);
+      if ((step.kind === "NAVIGATE" || step.kind === "API_GET") && !resolveNavigation((params.data as { url: string }).url, app.authorizedUrl)) {
+        return fail(`"${testCase.title}" step ${step.position + 1} ${step.kind === "API_GET" ? "requests" : "navigates"} outside the authorized URL.`);
       }
+    }
+    if (testCase.steps.every((s) => s.kind !== null)) {
+      const [issue] = stepSequenceIssues(testCase.steps);
+      if (issue) return fail(`"${testCase.title}": ${issue}.`);
     }
     for (const name of referencedSecrets(testCase.steps)) {
       if (!secrets.has(name)) return fail(`"${testCase.title}" uses secret ${name}, which this application doesn't have.`);

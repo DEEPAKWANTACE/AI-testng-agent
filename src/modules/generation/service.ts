@@ -7,6 +7,7 @@ import type { Actor } from "@/modules/auth/service";
 import { pageElementsSchema } from "@/modules/discovery/page-elements";
 import { referencedSecrets, resolveNavigation } from "@/modules/execution/steps";
 import { enqueueGeneration, QueueUnavailableError } from "@/modules/jobs/queues";
+import { INVENTORY_FEATURE_NAMES, loadInventoryContext } from "./inventory-context";
 import { buildPrompt, type GenerationContext } from "./prompt";
 import { providerFromEnv, ProviderError, type GenerationProvider } from "./providers";
 import { generatedCaseSchema, generationEnvelopeSchema, type GeneratedCase } from "./schema";
@@ -71,11 +72,13 @@ async function loadContext(jobId: string): Promise<{ context: GenerationContext;
     select: { id: true, name: true, url: true, pages: { orderBy: { createdAt: "desc" }, take: 20, select: { url: true, title: true, elements: true, error: true } } },
   });
   const auth = job.application.discoveryAuth;
+  const inventory = await loadInventoryContext(job.applicationId);
   return {
     job: { applicationId: job.applicationId, suiteId: job.suiteId, projectId: job.application.projectId, requestedById: job.requestedById, features: features.map((f) => ({ id: f.id, name: f.name })) },
     context: {
       application: { name: job.application.name, authorizedUrl: job.application.authorizedUrl, environment: job.application.environment },
       requirements: job.requirements,
+      inventory,
       secretNames: job.application.secrets.map((s) => s.name),
       login:
         auth?.mode === "FORM_LOGIN" && auth.loginUrl && auth.usernameSecret && auth.passwordSecret
@@ -107,7 +110,8 @@ async function loadContext(jobId: string): Promise<{ context: GenerationContext;
 export function validateGeneratedCases(raw: unknown, context: GenerationContext): { cases: GeneratedCase[]; rejected: number } {
   const envelope = generationEnvelopeSchema.safeParse(raw);
   if (!envelope.success) throw new ProviderError("The generator's output didn't match the expected format", false);
-  const featureNames = new Set(context.features.map((f) => f.name));
+  // Inventory-derived cases may use the inventory pseudo-features (API contracts, Access control…).
+  const featureNames = new Set([...context.features.map((f) => f.name), ...(context.inventory ? INVENTORY_FEATURE_NAMES : [])]);
   const secretNames = new Set(context.secretNames);
   const titles = new Set<string>();
   const cases: GeneratedCase[] = [];
@@ -118,7 +122,7 @@ export function validateGeneratedCases(raw: unknown, context: GenerationContext)
       parsed.success &&
       featureNames.has(parsed.data.feature) &&
       !titles.has(parsed.data.title.toLowerCase()) &&
-      parsed.data.steps.every((s) => s.kind !== "NAVIGATE" || resolveNavigation(s.params.url, context.application.authorizedUrl)) &&
+      parsed.data.steps.every((s) => (s.kind !== "NAVIGATE" && s.kind !== "API_GET") || resolveNavigation(s.params.url, context.application.authorizedUrl)) &&
       referencedSecrets(parsed.data.steps.map((s) => ({ kind: s.kind, params: s.params }))).every((n) => secretNames.has(n));
     if (!ok) {
       rejected++;

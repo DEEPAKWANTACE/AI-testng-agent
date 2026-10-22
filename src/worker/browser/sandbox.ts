@@ -18,14 +18,29 @@ const BLOCKED_PAGE = Buffer.from("<!doctype html><title>Blocked</title><p>Blocke
 /** The target itself is not allowed (private, metadata, unresolvable…). */
 export class TargetBlockedError extends Error {}
 
+/** A same-origin document or XHR/fetch response, as seen at the response stage. */
+export type InterceptedResponse = { url: string; method: string; type: "document" | "api"; status: number; headers: Array<{ name: string; value: string }>; body: Buffer };
+export type ReplacementResponse = { status: number; headers: Array<{ name: string; value: string }>; body: Buffer };
+
+/**
+ * Optional response hooks (mutation testing): `observe` sees same-origin responses, `mutate`
+ * may replace one. Only responses are touched, never requests, so the server receives exactly
+ * what the approved steps send.
+ */
+export type ResponseHooks = {
+  observe?: (response: InterceptedResponse) => void;
+  mutate?: (response: InterceptedResponse) => ReplacementResponse | null;
+};
+const MAX_HOOK_BODY = 1_000_000;
+
 export type Sandbox = {
   browser: Browser;
   proxy: EgressProxy;
   blocked: BlockedRequest[];
   redirectsBlocked: Array<{ from: string; to: string }>;
   newContext: (options?: BrowserContextOptions) => Promise<BrowserContext>;
-  /** New page with navigation-scope enforcement installed. */
-  newPage: (context: BrowserContext) => Promise<Page>;
+  /** New page with navigation-scope enforcement installed (and optional response hooks). */
+  newPage: (context: BrowserContext, hooks?: ResponseHooks) => Promise<Page>;
   close: () => Promise<void>;
 };
 
@@ -70,7 +85,7 @@ export async function launchSandbox(options: { authorizedUrl: string; allowExter
       context.on("close", () => contexts.delete(context));
       return context;
     },
-    newPage: async (context) => {
+    newPage: async (context, hooks) => {
       const page = await context.newPage();
       // Popups and new windows are closed; dialogs dismissed.
       context.on("page", (popup) => {
@@ -80,6 +95,7 @@ export async function launchSandbox(options: { authorizedUrl: string; allowExter
       await enforceNavigationScope(page, options.authorizedUrl, {
         onBlockedNavigation: (url) => proxy.blocked.push({ target: url, reason: "out-of-scope", detail: "Navigation outside the authorized URL" }),
         onBlockedRedirect: (from, to) => redirectsBlocked.push({ from, to }),
+        hooks,
       });
       return page;
     },
@@ -102,8 +118,10 @@ export async function launchSandbox(options: { authorizedUrl: string; allowExter
 export async function enforceNavigationScope(
   page: Page,
   authorizedUrl: string,
-  handlers: { onBlockedNavigation: (url: string) => void; onBlockedRedirect: (from: string, to: string) => void },
+  handlers: { onBlockedNavigation: (url: string) => void; onBlockedRedirect: (from: string, to: string) => void; hooks?: ResponseHooks },
 ) {
+  const origin = new URL(authorizedUrl).origin;
+  const hooks = handlers.hooks?.observe || handlers.hooks?.mutate ? handlers.hooks : undefined;
   const cdp = await page.context().newCDPSession(page);
   const { frameTree } = await cdp.send("Page.getFrameTree");
   const mainFrameId = frameTree.frame.id;
@@ -121,6 +139,13 @@ export async function enforceNavigationScope(
         body: BLOCKED_PAGE,
       });
     try {
+      const isDocument = event.resourceType === "Document";
+      // XHR/fetch responses are only paused when hooks are installed.
+      if (!isDocument) {
+        if (responseStatusCode === undefined) await cdp.send("Fetch.continueRequest", { requestId });
+        else if (!(await applyHooks(event))) await cdp.send("Fetch.continueResponse", { requestId });
+        return;
+      }
       if (frameId !== mainFrameId) {
         await (responseStatusCode === undefined ? cdp.send("Fetch.continueRequest", { requestId }) : cdp.send("Fetch.continueResponse", { requestId }));
         return;
@@ -143,16 +168,45 @@ export async function enforceNavigationScope(
           return;
         }
       }
+      if (await applyHooks(event)) return;
       await cdp.send("Fetch.continueResponse", { requestId });
     } catch {
       await cdp.send("Fetch.failRequest", { requestId, errorReason: "BlockedByClient" }).catch(() => {});
     }
   });
 
+  /** Runs the hooks on a same-origin, non-redirect response; true if it was answered here. */
+  async function applyHooks(event: { requestId: string; request: { url: string; method: string }; resourceType: string; responseStatusCode?: number; responseHeaders?: Array<{ name: string; value: string }> }): Promise<boolean> {
+    if (!hooks || event.responseStatusCode === undefined || (event.responseStatusCode >= 300 && event.responseStatusCode < 400)) return false;
+    let url: URL;
+    try {
+      url = new URL(event.request.url);
+    } catch {
+      return false;
+    }
+    if (url.origin !== origin) return false;
+    const { body, base64Encoded } = await cdp.send("Fetch.getResponseBody", { requestId: event.requestId }).catch(() => ({ body: null, base64Encoded: false }) as { body: string | null; base64Encoded: boolean });
+    if (body === null) return false;
+    const bytes = Buffer.from(body, base64Encoded ? "base64" : "utf8");
+    if (bytes.length > MAX_HOOK_BODY) return false;
+    const response: InterceptedResponse = { url: url.toString(), method: event.request.method, type: event.resourceType === "Document" ? "document" : "api", status: event.responseStatusCode, headers: event.responseHeaders ?? [], body: bytes };
+    hooks.observe?.(response);
+    const replacement = hooks.mutate?.(response);
+    if (!replacement) return false;
+    await cdp.send("Fetch.fulfillRequest", { requestId: event.requestId, responseCode: replacement.status, responseHeaders: replacement.headers, body: replacement.body.toString("base64") });
+    return true;
+  }
+
   await cdp.send("Fetch.enable", {
     patterns: [
       { urlPattern: "*", resourceType: "Document", requestStage: "Request" },
       { urlPattern: "*", resourceType: "Document", requestStage: "Response" },
+      ...(hooks
+        ? [
+            { urlPattern: "*", resourceType: "XHR" as const, requestStage: "Response" as const },
+            { urlPattern: "*", resourceType: "Fetch" as const, requestStage: "Response" as const },
+          ]
+        : []),
     ],
   });
 }

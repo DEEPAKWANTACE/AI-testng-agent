@@ -26,7 +26,16 @@ export type AuditAction =
   | "run.cancelled"
   | "run.retry"
   | "regression.created"
-  | "report.downloaded";
+  | "defect.verified"
+  | "baseline.approved"
+  | "baseline.rejected"
+  | "inventory.updated"
+  | "inventory.analysis.requested"
+  | "inventory.analysis.finished"
+  | "mutation.requested"
+  | "mutation.finished"
+  | "report.downloaded"
+  | "autotest.started";
 
 export type AuditEntry = {
   actor: { id: string; email: string } | null;

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { executableStepSchema } from "@/modules/execution/steps";
+import { executableStepSchema, stepSequenceIssues } from "@/modules/execution/steps";
 
 /** Test categories the generator must produce (subset of TestCaseType). */
 export const GENERATED_CATEGORIES = ["END_TO_END", "POSITIVE", "NEGATIVE", "BOUNDARY", "PERMISSION", "REGRESSION"] as const;
@@ -25,7 +25,10 @@ export const generatedCaseSchema = z
       })
       .strict(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, ctx) => {
+    for (const message of stepSequenceIssues(value.steps)) ctx.addIssue({ code: "custom", path: ["steps"], message });
+  });
 
 export type GeneratedCase = z.infer<typeof generatedCaseSchema>;
 

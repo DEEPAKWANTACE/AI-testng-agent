@@ -5,6 +5,8 @@ import { db } from "@/lib/db";
 import { writeArtifact } from "@/modules/artifacts/storage";
 import { deriveFeatures } from "@/modules/discovery/features";
 import { pageElementsSchema } from "@/modules/discovery/page-elements";
+import { queueAutoGeneration } from "@/modules/auto-test/generate";
+import { syncDiscoveryInventory } from "@/modules/inventory/service";
 import { resolveSecret } from "@/modules/secrets/resolver";
 import { crawl, CrawlError, type CrawlCredentials, type CrawlStats } from "./crawler";
 
@@ -127,7 +129,7 @@ export async function processRun(runId: string, config: WorkerConfig): Promise<v
   const owned = { id: runId, workerId: config.workerId };
   const run = await db().discoveryRun.findUniqueOrThrow({
     where: { id: runId },
-    select: { startUrl: true, maxDepth: true, maxPages: true, application: { select: { id: true, authorizedUrl: true } } },
+    select: { startUrl: true, maxDepth: true, maxPages: true, autoGenerate: true, application: { select: { id: true, authorizedUrl: true } } },
   });
   let pageNumber = 0;
 
@@ -204,6 +206,15 @@ export async function processRun(runId: string, config: WorkerConfig): Promise<v
       where: { ...owned, status: "RUNNING" },
       data: { status: "COMPLETED", finishedAt: new Date(), stats: statsJson, summary: summarize(stats, featureCount) },
     });
+    // Discovered pages become ROUTE items of the application's inventory (best effort).
+    await syncDiscoveryInventory(run.application.id).catch((error) => console.error(`[discovery] inventory sync for ${runId} failed`, error));
+    const completed = run.autoGenerate && (await db().discoveryRun.findUnique({ where: { id: runId }, select: { status: true } }))?.status === "COMPLETED";
+    if (completed) {
+      const auto = await queueAutoGeneration(runId).catch((error) => ({ jobs: 0, features: 0, error: String(error?.message ?? error) }));
+      const note = auto.error ? `Auto-generation not fully queued: ${auto.error}` : `Auto-generation queued: ${auto.jobs} job${auto.jobs === 1 ? "" : "s"} for ${auto.features} feature${auto.features === 1 ? "" : "s"}`;
+      const done = await db().discoveryRun.findUnique({ where: { id: runId }, select: { summary: true } });
+      await db().discoveryRun.update({ where: { id: runId }, data: { summary: [done?.summary, note].filter(Boolean).join(" · ") } });
+    }
     await db().discoveryRun.updateMany({ where: { ...owned, status: "CANCELLED", finishedAt: null }, data: { finishedAt: new Date(), stats: statsJson } });
   } catch (error) {
     const expected = error instanceof CrawlError;

@@ -14,6 +14,7 @@ const ALL: Permission[] = [
   "suite.edit",
   "suite.delete",
   "plan.review",
+  "defect.verify",
   "run.manage",
 ];
 
@@ -46,7 +47,7 @@ describe("authorization policy", () => {
   });
 
   it("lets owners do everything except review without a reviewer role", () => {
-    expect(allowed("QA_ENGINEER", "OWNER")).toEqual(ALL.filter((p) => p !== "plan.review"));
+    expect(allowed("QA_ENGINEER", "OWNER")).toEqual(ALL.filter((p) => p !== "plan.review" && p !== "defect.verify"));
     expect(allowed("QA_LEAD", "OWNER")).toEqual(ALL);
   });
 
@@ -54,6 +55,13 @@ describe("authorization policy", () => {
     expect(can("QA_LEAD", "EDITOR", "plan.review")).toBe(true);
     expect(can("QA_LEAD", "VIEWER", "plan.review")).toBe(false);
     expect(can("QA_ENGINEER", "EDITOR", "plan.review")).toBe(false);
+  });
+
+  it("requires a reviewer role and at least editor access to verify defects", () => {
+    expect(can("QA_LEAD", "EDITOR", "defect.verify")).toBe(true);
+    expect(can("QA_LEAD", "VIEWER", "defect.verify")).toBe(false);
+    expect(can("QA_ENGINEER", "OWNER", "defect.verify")).toBe(false);
+    expect(can("VIEWER", "OWNER", "defect.verify")).toBe(false);
   });
 
   it("caps global viewers at read-only whatever their project role", () => {

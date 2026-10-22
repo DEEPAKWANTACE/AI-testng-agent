@@ -8,10 +8,78 @@ import type { AddressInfo } from "node:net";
  * page that tries to load internal resources from the browser.
  */
 
+/** OpenAPI description of the Demo Shop's JSON API (used by tests and the benchmark). */
+export const DEMO_OPENAPI = {
+  openapi: "3.0.3",
+  info: { title: "Demo Shop API", version: "1.0.0" },
+  components: {
+    securitySchemes: { session: { type: "apiKey", in: "cookie", name: "demo_session" } },
+    schemas: {
+      Product: { type: "object", required: ["id", "name", "price"], additionalProperties: false, properties: { id: { type: "integer", minimum: 1 }, name: { type: "string", minLength: 1 }, price: { type: "number", minimum: 0 } } },
+      Cart: {
+        type: "object",
+        required: ["items", "itemCount", "subtotal", "discount", "total", "currency"],
+        properties: {
+          items: { type: "array", items: { type: "object", required: ["productId", "price", "quantity", "lineTotal"], properties: { productId: { type: "integer" }, price: { type: "number" }, quantity: { type: "integer", minimum: 1, maximum: 99 }, lineTotal: { type: "number", minimum: 0 } } } },
+          itemCount: { type: "integer", minimum: 0 },
+          coupon: { type: "string", nullable: true },
+          subtotal: { type: "number", minimum: 0 },
+          discount: { type: "number", minimum: 0 },
+          total: { type: "number", minimum: 0 },
+          currency: { type: "string", enum: ["USD"] },
+        },
+      },
+    },
+  },
+  paths: {
+    "/api/products": {
+      get: {
+        summary: "List products",
+        parameters: [{ name: "limit", in: "query", schema: { type: "integer", minimum: 1, maximum: 50 } }],
+        responses: {
+          "200": { description: "Products", content: { "application/json": { schema: { type: "object", required: ["products", "total"], properties: { products: { type: "array", items: { $ref: "#/components/schemas/Product" } }, total: { type: "integer", minimum: 0 } } } } } },
+          "400": { description: "Invalid limit" },
+        },
+      },
+    },
+    "/api/cart": { get: { summary: "Current cart", responses: { "200": { description: "Cart", content: { "application/json": { schema: { $ref: "#/components/schemas/Cart" } } } } } } },
+    "/api/profile": {
+      get: {
+        summary: "Signed-in shopper's profile",
+        security: [{ session: [] }],
+        responses: {
+          "200": { description: "Profile", content: { "application/json": { schema: { type: "object", required: ["email", "displayName"], properties: { email: { type: "string", format: "email" }, displayName: { type: "string", minLength: 1 } } } } } },
+          "401": { description: "Not signed in" },
+        },
+      },
+    },
+    "/cart": { post: { summary: "Add to cart", responses: { "302": { description: "Added" } } } },
+  },
+};
+
 export const DEMO_CREDENTIALS = {
   email: process.env.DEMO_USER_EMAIL ?? "shopper@demo-shop.test",
   password: process.env.DEMO_USER_PASSWORD ?? "demo-shopper-pass-1",
 };
+
+/**
+ * Seeded faults the Demo Shop can exhibit (ground truth for tests and the benchmark). Each is a
+ * realistic defect of a different kind; "slow-products" is noise (slower, but correct).
+ */
+export const DEMO_FAULTS = [
+  "restyled-products",
+  "wrong-discount",
+  "line-total-ignores-quantity",
+  "cart-api-total-as-string",
+  "products-page-500",
+  "account-unprotected",
+  "profile-api-unprotected",
+  "products-limit-unvalidated",
+  "profile-not-saved",
+  "search-500",
+  "slow-products",
+] as const;
+export type DemoFault = (typeof DEMO_FAULTS)[number];
 
 export type DemoApp = {
   url: string;
@@ -19,11 +87,16 @@ export type DemoApp = {
   hits: Map<string, number>;
   /** Simulates a regression: the products page loses its heading and list. */
   setBroken: (broken: boolean) => void;
+  /** Turns a seeded fault on or off (see DEMO_FAULTS); used by tests and the benchmark. */
+  setFault: (fault: DemoFault, on: boolean) => void;
+  clearFaults: () => void;
   close: () => Promise<void>;
 };
 
 const SESSION = "demo_session";
 const sessions = new Set<string>();
+/** Saved profile per session (so tests can check a change survives a reload). */
+const profiles = new Map<string, { displayName: string }>();
 
 const layout = (title: string, body: string, signedIn: boolean) => `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>${title} · Demo Shop</title>
@@ -45,15 +118,59 @@ const products = [
   { id: 3, name: "Water bottle", price: 19 },
 ];
 
+/** Coupons: code → percent off the subtotal. */
+const COUPONS: Record<string, number> = { SPRING10: 10 };
+
+type Cart = { lines: Map<number, number>; coupon: string | null };
+const CART_COOKIE = "demo_cart";
+const carts = new Map<string, Cart>();
+
+const money = (value: number) => Math.round(value * 100) / 100;
+const usd = (value: number) => `$${money(value).toFixed(2)}`;
+
+function cartSummary(cart: Cart, faults: ReadonlySet<DemoFault> = new Set()) {
+  const items = [...cart.lines.entries()].map(([productId, quantity]) => {
+    const product = products.find((p) => p.id === productId)!;
+    return { productId, name: product.name, price: product.price, quantity, lineTotal: money(faults.has("line-total-ignores-quantity") ? product.price : product.price * quantity) };
+  });
+  const subtotal = money(items.reduce((sum, item) => sum + item.lineTotal, 0));
+  const percent = cart.coupon ? (COUPONS[cart.coupon] ?? 0) + (faults.has("wrong-discount") ? 5 : 0) : 0;
+  const discount = money((subtotal * percent) / 100);
+  const total = money(subtotal - discount);
+  return { items, itemCount: items.reduce((n, i) => n + i.quantity, 0), coupon: cart.coupon, subtotal, discount, total: faults.has("cart-api-total-as-string") ? (total.toFixed(2) as unknown as number) : total, currency: "USD" };
+}
+
+function readBody(req: http.IncomingMessage): Promise<URLSearchParams> {
+  return new Promise((resolve) => {
+    let data = "";
+    req.on("data", (chunk) => (data += chunk));
+    req.on("end", () => resolve(new URLSearchParams(data)));
+  });
+}
+
 export async function startDemoApp({ port = 0, host = "127.0.0.1", canaryPort }: { port?: number; host?: string; canaryPort: number }): Promise<DemoApp> {
   const hits = new Map<string, number>();
   let broken = false;
+  const faults = new Set<DemoFault>();
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://demo.invalid");
     hits.set(url.pathname, (hits.get(url.pathname) ?? 0) + 1);
     const cookie = /(?:^|;\s*)demo_session=([^;]+)/.exec(req.headers.cookie ?? "")?.[1];
     const signedIn = Boolean(cookie && sessions.has(cookie));
+    let cartId = /(?:^|;\s*)demo_cart=([\w-]+)/.exec(req.headers.cookie ?? "")?.[1];
+    const cart = () => {
+      if (!cartId || !carts.has(cartId)) {
+        cartId = Math.random().toString(36).slice(2);
+        carts.set(cartId, { lines: new Map(), coupon: null });
+        res.setHeader("set-cookie", `${CART_COOKIE}=${cartId}; Path=/; SameSite=Lax`);
+      }
+      return carts.get(cartId)!;
+    };
+    const json = (status: number, body: unknown) => {
+      res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(body));
+    };
     const html = (status: number, title: string, body: string, headers: http.OutgoingHttpHeaders = {}) => {
       res.writeHead(status, { "content-type": "text/html; charset=utf-8", ...headers });
       res.end(layout(title, body, signedIn));
@@ -70,10 +187,11 @@ export async function startDemoApp({ port = 0, host = "127.0.0.1", canaryPort }:
           <li><a href="/promo">Spring promo</a></li><li><a href="/slow">Store locator</a></li>
           <li><a href="/redirect/internal">Partner login</a></li><li><a href="/redirect/metadata">Status page</a></li>
           <li><a href="/admin/delete-everything">Reset store data</a></li></ul>`);
-      case url.pathname === "/products" && broken:
+      case url.pathname === "/products" && (broken || faults.has("products-page-500")):
         return html(500, "Error", "<h2>Something went wrong</h2>");
       case url.pathname === "/products":
-        return html(200, "Products", `<h1>Products</h1><ul>${products.map((p) => `<li><a href="/products/${p.id}">${p.name}</a> — $${p.price}</li>`).join("")}</ul>
+        if (faults.has("slow-products")) await new Promise((resolve) => setTimeout(resolve, 800));
+        return html(200, "Products", `<h1>Products</h1><ul${faults.has("restyled-products") ? ' style="background:#fde047;color:#b45309"' : ""}>${products.map((p) => `<li><a href="/products/${p.id}">${p.name}</a> — $${p.price}</li>`).join("")}</ul>
           <a href="/products/legacy">Old catalogue</a>
           <label>Sort by <select name="sort"><option>Price</option><option>Name</option></select></label>`);
       case /^\/products\/\d+$/.test(url.pathname): {
@@ -84,10 +202,49 @@ export async function startDemoApp({ port = 0, host = "127.0.0.1", canaryPort }:
           <label>Quantity <input type="number" name="quantity" min="1" value="1" required></label><button type="submit">Add to cart</button></form>
           <a href="/products">Back to products</a>`);
       }
-      case url.pathname === "/cart":
-        return html(200, "Cart", `<h1>Your cart</h1><p>2 items</p>
+      case url.pathname === "/api/products": {
+        const raw = url.searchParams.get("limit");
+        const limit = raw === null ? products.length : Number(raw);
+        if (!Number.isInteger(limit) || limit < 1 || (limit > 50 && !faults.has("products-limit-unvalidated"))) return json(400, { error: "limit must be an integer from 1 to 50" });
+        return json(200, { products: products.slice(0, limit), total: products.length });
+      }
+      case url.pathname === "/api/profile":
+        if (!signedIn && !faults.has("profile-api-unprotected")) return json(401, { error: "Sign in required" });
+        return json(200, { email: DEMO_CREDENTIALS.email, displayName: (cookie && profiles.get(cookie)?.displayName) || "Sam Shopper" });
+      case url.pathname === "/api/cart":
+        return json(200, cartSummary(cart(), faults));
+      case url.pathname === "/cart" && req.method === "POST": {
+        const form = await readBody(req);
+        const productId = Number(form.get("productId"));
+        const quantity = Math.trunc(Number(form.get("quantity") ?? 1));
+        if (!products.some((p) => p.id === productId) || !(quantity >= 1 && quantity <= 99)) {
+          return html(422, "Cart", '<h1>Your cart</h1><p role="alert">Quantity must be between 1 and 99</p>');
+        }
+        const c = cart();
+        c.lines.set(productId, (c.lines.get(productId) ?? 0) + quantity);
+        return redirect("/cart");
+      }
+      case url.pathname === "/cart/coupon" && req.method === "POST": {
+        const code = (await readBody(req)).get("coupon")?.trim().toUpperCase() ?? "";
+        const c = cart();
+        if (!(code in COUPONS)) return html(422, "Cart", '<h1>Your cart</h1><p role="alert">That coupon code isn\'t valid</p><a href="/cart">Back to cart</a>');
+        c.coupon = code;
+        return redirect("/cart");
+      }
+      case url.pathname === "/cart": {
+        const s = cartSummary(cart(), faults);
+        const rows = s.items
+          .map((i) => `<tr data-testid="line-${i.productId}"><td>${i.name}</td><td data-testid="price-${i.productId}">${usd(i.price)}</td><td data-testid="qty-${i.productId}">${i.quantity}</td><td data-testid="line-total-${i.productId}">${usd(i.lineTotal)}</td></tr>`)
+          .join("");
+        return html(200, "Cart", `<h1>Your cart</h1><p data-testid="item-count">${s.itemCount} items</p>
+          <table aria-label="Cart lines"><tr><th>Product</th><th>Price</th><th>Qty</th><th>Total</th></tr>${rows}</table>
+          <dl><dt>Subtotal</dt><dd data-testid="subtotal">${usd(s.subtotal)}</dd><dt>Discount${s.coupon ? ` (${s.coupon})` : ""}</dt><dd data-testid="discount">${usd(s.discount)}</dd>
+          <dt>Total</dt><dd data-testid="total">${usd(s.total)}</dd></dl>
+          <p data-testid="sync-status">Syncing…</p>
+          <script>fetch("/api/cart").then((r) => r.json()).then((c) => { document.querySelector('[data-testid="sync-status"]').textContent = "Synced " + c.itemCount + " items"; });</script>
           <form action="/cart/coupon" method="post" aria-label="Apply coupon"><label>Coupon code <input name="coupon" placeholder="SPRING10"></label><button>Apply</button></form>
           <button type="button" aria-label="Empty cart">Empty cart</button><a href="/checkout">Proceed to checkout</a>`);
+      }
       case url.pathname === "/checkout":
         return html(200, "Checkout", `<h1>Checkout</h1>
           <form action="/checkout" method="post" aria-label="Checkout"><label>Email <input type="email" name="email" required autocomplete="email"></label>
@@ -95,6 +252,8 @@ export async function startDemoApp({ port = 0, host = "127.0.0.1", canaryPort }:
           <button type="submit">Place order</button></form><a href="/checkout/help">Payment help</a>`);
       case url.pathname === "/checkout/help":
         return html(200, "Payment help", "<h1>Payment help</h1><p>We accept major cards.</p>");
+      case url.pathname === "/search" && faults.has("search-500"):
+        return html(500, "Error", "<h2>Something went wrong</h2>");
       case url.pathname === "/search":
         return html(200, "Search", `<h1>Results for “${(url.searchParams.get("q") ?? "").replace(/[<>&"]/g, "")}”</h1>`);
       case url.pathname === "/about":
@@ -105,6 +264,9 @@ export async function startDemoApp({ port = 0, host = "127.0.0.1", canaryPort }:
         return html(200, "History", '<h1>History</h1><a href="/about/team/history/archive">Archive</a>');
       case url.pathname === "/about/team/history/archive":
         return html(200, "Archive", "<h1>Archive</h1>");
+      case url.pathname === "/deals":
+        // Deliberately flaky (for tests): the heading only renders on every second request.
+        return html(200, "Deals", (hits.get("/deals") ?? 0) % 2 === 0 ? "<h1>Deal of the day</h1>" : "<p>Loading deals…</p>");
       case url.pathname === "/help":
         return html(200, "Help", "<h1>Help centre</h1><p>Contact support any time.</p>");
       case url.pathname === "/promo":
@@ -147,10 +309,16 @@ export async function startDemoApp({ port = 0, host = "127.0.0.1", canaryPort }:
         if (cookie) sessions.delete(cookie);
         return redirect("/", { "set-cookie": `${SESSION}=; Max-Age=0; Path=/` });
       case url.pathname.startsWith("/account"):
-        if (!signedIn) return redirect(`/login?next=${encodeURIComponent(url.pathname)}`);
+        if (!signedIn && !faults.has("account-unprotected")) return redirect(`/login?next=${encodeURIComponent(url.pathname)}`);
         if (url.pathname === "/account/orders") return html(200, "Orders", '<h1>Your orders</h1><table><tr><td>#1001</td><td>Shipped</td></tr></table>');
-        return html(200, "My account", `<h1 id="account-heading">My account</h1>
-          <form action="/account" method="post" aria-label="Profile"><label>Display name <input name="displayName" value="Sam Shopper"></label>
+        if (url.pathname === "/account" && req.method === "POST") {
+          const name = ((await readBody(req)).get("displayName") ?? "").trim().slice(0, 80);
+          if (!name) return html(422, "My account", '<h1 id="account-heading">My account</h1><p role="alert">Display name is required</p>');
+          if (!faults.has("profile-not-saved")) profiles.set(cookie!, { displayName: name });
+          return redirect("/account?saved=1");
+        }
+        return html(200, "My account", `<h1 id="account-heading">My account</h1>${url.searchParams.get("saved") ? '<p role="status">Profile saved</p>' : ""}
+          <form action="/account" method="post" aria-label="Profile"><label>Display name <input name="displayName" value="${(profiles.get(cookie!)?.displayName ?? "Sam Shopper").replace(/[<>&"]/g, "")}"></label>
           <label>Phone <input type="tel" name="phone" value="+1 555 0100"></label><label><input type="checkbox" name="newsletter" checked> Newsletter</label><button>Save profile</button></form>
           <a href="/account/orders">Order history</a>`);
       case url.pathname === "/files/terms.pdf":
@@ -170,6 +338,11 @@ export async function startDemoApp({ port = 0, host = "127.0.0.1", canaryPort }:
     setBroken: (value) => {
       broken = value;
     },
+    setFault: (fault, on) => {
+      if (on) faults.add(fault);
+      else faults.delete(fault);
+    },
+    clearFaults: () => faults.clear(),
     close: () => new Promise((resolve) => server.close(() => resolve())),
   };
 }

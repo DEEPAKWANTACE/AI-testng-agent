@@ -80,7 +80,8 @@ async function RunsTable() {
                   {run.report ? (
                     <>
                       <span className="text-emerald-600">{run.report.passed} passed</span> ·{" "}
-                      <span className="text-red-600">{run.report.failed + run.report.errored} failed</span> · {run.report.blocked} blocked
+                      <span className="text-red-600">{run.report.failed} failed</span> · {run.report.blocked} blocked
+                      {run.report.inconclusive + run.report.errored ? <> · {run.report.inconclusive + run.report.errored} inconclusive</> : null}
                       {run.report.regressions ? <span className="ml-1 font-medium text-red-600">· {run.report.regressions} regressed</span> : null}
                     </>
                   ) : run.blockedReason ? (

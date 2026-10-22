@@ -34,7 +34,7 @@ async function ReportsTable() {
         <EmptyState title="No reports yet" description="A report is created when a test run finishes." />
       ) : (
         <Table>
-          <THead columns={["Plan", "Run", "Passed", "Failed", "Blocked", "Regressions", "Finished"]} />
+          <THead columns={["Plan", "Run", "Passed", "Failed", "Blocked", "Inconclusive", "Regressions", "Finished"]} />
           <TBody>
             {runs.map((run) => (
               <tr key={run.id}>
@@ -46,8 +46,9 @@ async function ReportsTable() {
                 </TD>
                 <TD><StatusBadge status={run.status} /></TD>
                 <TD className="text-emerald-600 tabular-nums">{run.report!.passed}</TD>
-                <TD className="text-red-600 tabular-nums">{run.report!.failed + run.report!.errored}</TD>
+                <TD className="text-red-600 tabular-nums">{run.report!.failed}</TD>
                 <TD className="tabular-nums">{run.report!.blocked}</TD>
+                <TD className="tabular-nums">{run.report!.inconclusive + run.report!.errored}</TD>
                 <TD className={run.report!.regressions ? "font-medium text-red-600 tabular-nums" : "tabular-nums"}>{run.report!.regressions}</TD>
                 <TD className="whitespace-nowrap">{formatDateTime(run.finishedAt ?? run.report!.createdAt)}</TD>
               </tr>

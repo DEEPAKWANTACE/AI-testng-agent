@@ -26,6 +26,8 @@ export const SECRET_REFERENCE_FORMATS: Record<SecretProvider, { scheme: string; 
     pattern: /^azure-kv:\/\/[a-z0-9-]+\/[A-Za-z0-9-]+(\/[0-9a-f]{32})?$/,
     example: "azure-kv://acme-qa-vault/storefront-password",
   },
+  // Created only by the dashboard's credential form (encrypted at rest); can't be typed in.
+  LOCAL: { scheme: "local://", pattern: /^local:\/\/[a-z0-9]+$/, example: "local://cm0abc123" },
 };
 
 export function providerForReference(reference: string): SecretProvider | null {
@@ -47,7 +49,9 @@ export const secretReferenceInputSchema = z
       .max(512)
       .superRefine((reference, ctx) => {
         const provider = providerForReference(reference);
-        if (!provider) {
+        if (provider === "LOCAL") {
+          ctx.addIssue({ code: "custom", message: "local:// references are created by the credentials form, not entered by hand" });
+        } else if (!provider) {
           ctx.addIssue({
             code: "custom",
             message: "Enter a reference such as env://QA_NAME or vault://path#key — never the secret value itself",
